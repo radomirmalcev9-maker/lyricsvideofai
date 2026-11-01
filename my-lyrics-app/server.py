@@ -116,14 +116,23 @@ def _word_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b).ratio()
 
 
-def transcribe_words(audio_path: Path, language: str | None = None) -> list[dict]:
+def transcribe_words(audio_path: Path, language: str | None = None,
+                     initial_prompt: str | None = None) -> list[dict]:
     model = get_whisper()
+    # Hint Whisper with the user-supplied lyrics: nudges tokenizer toward the
+    # exact words in the song (proper nouns, slang, Russian/English mix) and
+    # reduces hallucination. condition_on_previous_text=False prevents error
+    # propagation between segments.
     segments, _info = model.transcribe(
         str(audio_path),
         language=language,
         word_timestamps=True,
-        # Don't let VAD chop off word tails at line boundaries.
         vad_filter=False,
+        initial_prompt=(initial_prompt or None),
+        condition_on_previous_text=False,
+        beam_size=5,
+        best_of=5,
+        temperature=0.0,
     )
     words: list[dict] = []
     for seg in segments:
@@ -397,15 +406,42 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
         if b["start"] > a["end"] + eps:
             a["end"] = round(b["start"] - eps, 3)
 
-    # Final sanity clamp: ensure every word's start/end lies within its scene.
+    # Final sanity clamp: ensure every word's start/end lies within its scene,
+    # enforce monotonic word ordering within a scene, and guarantee a minimum
+    # per-word duration so karaoke highlighting doesn't flicker through a
+    # word instantly.
+    MIN_WORD_DUR = 0.08   # 80 ms — shorter than this is perceptually a flash
     for sc in scenes:
+        prev_end = sc["start"]
         for w in sc["words"]:
+            # Monotonicity relative to previous word
+            if w["start"] < prev_end - 0.001:
+                w["start"] = prev_end
+            # Inside scene
             if w["start"] < sc["start"]:
                 w["start"] = sc["start"]
             if w["end"] > sc["end"]:
                 w["end"] = sc["end"]
-            if w["end"] < w["start"]:
-                w["end"] = round(w["start"] + 0.05, 3)
+            if w["end"] < w["start"] + MIN_WORD_DUR:
+                w["end"] = round(min(sc["end"], w["start"] + MIN_WORD_DUR), 3)
+            prev_end = w["end"]
+        # If the last word runs past scene end after min-dur expansion, nudge
+        # scene end forward (only if it doesn't break the next scene).
+        if sc["words"]:
+            need = sc["words"][-1]["end"]
+            if need > sc["end"]:
+                sc["end"] = round(need + 0.05, 3)
+
+    # One last non-overlap / monotonicity pass over scenes to repair anything
+    # the min-dur expansion might have pushed.
+    for idx in range(len(scenes) - 1):
+        a, b = scenes[idx], scenes[idx + 1]
+        if a["end"] > b["start"]:
+            mid = round((a["end"] + b["start"]) / 2, 3)
+            a["end"] = round(mid, 3)
+            b["start"] = round(mid + eps, 3)
+            if b["end"] <= b["start"]:
+                b["end"] = round(b["start"] + 0.3, 3)
 
     return scenes
 
@@ -430,13 +466,16 @@ DIRECTOR_SYSTEM_PROMPT = """\
 ═══════════════════════════════════════════════════════════════
 КАЧЕСТВО ВИДЖЕТА — ЭТО ГЛАВНОЕ. ТРЕБОВАНИЯ К РЕАЛИЗАЦИИ:
 ═══════════════════════════════════════════════════════════════
-1. Обёртка: <div class="w"> с ровно ТРЕМЯ вложенными смысловыми слоями:
-   • стеклянная карточка-корпус (position:relative; width:820px; min-height:520px;
-     border-radius:56px; padding:44px; display:flex; flex-direction:column; gap:18px;
-     background: для темы dark — linear-gradient(145deg, rgba(255,255,255,.14), rgba(255,255,255,.04));
-     для темы light — linear-gradient(145deg, rgba(255,255,255,.78), rgba(255,255,255,.45));
-     border: 1px solid rgba(255,255,255,.22) (dark) / rgba(255,255,255,.65) (light);
-     box-shadow: 0 30px 80px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.35);
+1. Обёртка: <div class="w"> с ровно ТРЕМЯ вложенными смысловыми слоями. ОБЯЗАТЕЛЬНО:
+     width:820px; height:520px (точно в пикселях, НЕ min-height, не 100%, не auto),
+     position:relative; border-radius:56px; padding:44px;
+     display:flex; flex-direction:column; gap:18px;
+     background: для темы dark — linear-gradient(145deg, rgba(255,255,255,.16), rgba(255,255,255,.05));
+     для темы light — linear-gradient(145deg, rgba(255,255,255,.82), rgba(255,255,255,.50));
+     border: 1px solid rgba(255,255,255,.25) (dark) / rgba(255,255,255,.75) (light);
+     box-shadow: 0 30px 80px rgba(0,0,0,.45),
+                 inset 0 1px 0 rgba(255,255,255,.45),
+                 inset 0 -1px 0 rgba(255,255,255,.08);
      backdrop-filter: blur(40px) saturate(180%);
      -webkit-backdrop-filter: blur(40px) saturate(180%);
      overflow:hidden;
@@ -581,17 +620,27 @@ scene_id/widget_html/theme/accent/background/entrance.
 # comfortably sized while giving the model enough bandwidth to design
 # dense, high-fidelity cards (3 levels of typography, multiple shapes,
 # gradients, an @keyframes animation, etc.).
-_BATCH_SIZE = 4
-# How many times to retry a batch that times out/5xx before giving up.
-_BATCH_RETRIES = 2
-# Per-request streaming timeout. Richer widgets = bigger responses; 12 minutes
-# covers long tracks with slow first-token latency.
-_QUEUE_TIMEOUT = 720.0
-# Between-batch pause (seconds) to give Arena time to cool down.
-_BATCH_PAUSE = 1.5
+_BATCH_SIZE_FAST = 4
+_BATCH_SIZE_MAX  = 3      # 3 scenes/batch for the strongest model — richer widgets, fewer tokens each.
+_BATCH_RETRIES = 3
+_QUEUE_TIMEOUT_FAST = 600.0
+_QUEUE_TIMEOUT_MAX  = 900.0   # 15 minutes when max model is selected
+_BATCH_PAUSE = 1.8
 
 
-def _call_batch(client, batch_llm: list[dict], model: str | None) -> list[dict]:
+def _resolve_batch_params(model: str | None) -> tuple[int, float]:
+    """Return (batch_size, queue_timeout_seconds) appropriate for the model."""
+    # Anything that isn't the default fast model gets the MAX-budget settings
+    # (smaller batches, longer timeout) so richer models have room to design
+    # dense cards without hitting response limits.
+    if model is None or model == "" or model == "fast":
+        return _BATCH_SIZE_FAST, _QUEUE_TIMEOUT_FAST
+    return _BATCH_SIZE_MAX, _QUEUE_TIMEOUT_MAX
+
+
+def _call_batch(client, batch_llm: list[dict], model: str | None,
+                batch_idx: int, total_batches: int,
+                used_kinds: list[str]) -> list[dict]:
     """Send one batch of scenes using a FRESH single-turn client.complete() call.
 
     We deliberately do NOT use a single multi-turn client.chat() session across
@@ -602,15 +651,28 @@ def _call_batch(client, batch_llm: list[dict], model: str | None) -> list[dict]:
     session so captcha does not re-appear.
     """
     # Build a self-contained prompt (no reliance on prior chat context).
-    # Include a short list of previously-used widget themes via a simple hint
-    # so that adjacent batches don't all come back looking identical.
+    variety_hint = ""
+    if used_kinds:
+        # Send the last few widget concepts that were already used so the
+        # model doesn't repeat them back-to-back. Keep the hint short to
+        # save tokens — just the most recent 4 kinds.
+        recent = used_kinds[-4:]
+        variety_hint = (
+            "\n\nВ ПРЕДЫДУЩИХ СТРОКАХ УЖЕ БЫЛИ виджеты: "
+            + ", ".join(recent)
+            + ". В этой порции сделай ДРУГИЕ виджеты (другой экран iOS), "
+              "чтобы кадры не повторялись. "
+        )
     user_prompt = (
         DIRECTOR_SYSTEM_PROMPT
+        + (("\n\n" + _DIRECTOR_FOLLOWUP_HINT) if batch_idx > 0 else "")
+        + variety_hint
         + "\n\n---\n\nСцены для оформления (верни ровно столько же объектов, "
         "тем же порядком, с теми же scene_id):\n"
         + json.dumps(batch_llm, ensure_ascii=False, indent=2)
     )
-    cfg = GenerationConfig(queue_timeout=_QUEUE_TIMEOUT)
+    _bsize, _timeout = _resolve_batch_params(model)
+    cfg = GenerationConfig(queue_timeout=_timeout)
     last_err: Exception | None = None
     for attempt in range(_BATCH_RETRIES + 1):
         try:
@@ -677,20 +739,49 @@ def ask_arena(all_scenes: list[dict], model: str | None) -> tuple[list[dict], li
     # each conversation once the model's answer is fully received, so the
     # per-batch client.complete() calls don't leave orphaned single-turn
     # chats littering the user's Arena sidebar.
-    options = AutoOptions(fast_model=model is None, archive_after_answer=True)
+    batch_size, _timeout = _resolve_batch_params(model)
+    options = AutoOptions(fast_model=(model is None or model == "fast"),
+                          archive_after_answer=True)
     out_scenes: list[dict] = []
     total = len(all_scenes)
+    n_batches = (total + batch_size - 1) // batch_size
+    used_kinds: list[str] = []
     with auto_direct_client(options, verification_token="auto") as client:
-        for i in range(0, total, _BATCH_SIZE):
-            batch_full = all_scenes[i : i + _BATCH_SIZE]
-            batch_llm  = llm_scenes[i : i + _BATCH_SIZE]
-            print(f"[arena] batch {i//_BATCH_SIZE + 1}/{(total + _BATCH_SIZE - 1)//_BATCH_SIZE}: "
-                  f"scenes {batch_full[0]['scene_id']}..{batch_full[-1]['scene_id']}",
+        for bi, i in enumerate(range(0, total, batch_size)):
+            batch_full = all_scenes[i : i + batch_size]
+            batch_llm  = llm_scenes[i : i + batch_size]
+            print(f"[arena] batch {bi+1}/{n_batches}: "
+                  f"scenes {batch_full[0]['scene_id']}..{batch_full[-1]['scene_id']} "
+                  f"(model={model or 'fast'}, size={len(batch_full)})",
                   flush=True)
             try:
-                batch_out = _call_batch(client, batch_llm, model)
+                batch_out = _call_batch(client, batch_llm, model, bi, n_batches, used_kinds)
                 ok = True
                 err_msg = ""
+                # Heuristically tag each scene with its widget "kind" for
+                # the variety hint to the next batch. We grep for obvious
+                # keywords in widget_html — crude but effective.
+                for s in batch_out:
+                    if not isinstance(s, dict): continue
+                    html = (s.get("widget_html") or "").lower()
+                    for keyword, label in (
+                        ("звонк", "входящий звонок"),
+                        ("apple pay", "Apple Pay"),
+                        ("face id", "Face ID"),
+                        ("погод", "Погода"),
+                        ("imessage", "iMessage"),
+                        ("камер", "Камера"),
+                        ("карт", "Карты"),
+                        ("кальц", "Кальца активности"),
+                        ("будильн", "Будильник"),
+                        ("play", "Now Playing"),
+                        ("уведомл", "Уведомление"),
+                        ("лун", "Луна/ночь"),
+                        ("сердеч", "Сердечко"),
+                    ):
+                        if keyword in html:
+                            used_kinds.append(label)
+                            break
             except Exception as exc:  # noqa: BLE001
                 ok = False
                 err_msg = str(exc)
@@ -712,7 +803,7 @@ def ask_arena(all_scenes: list[dict], model: str | None) -> tuple[list[dict], li
                 s_out.setdefault("background", {"type": "gradient", "colors": ["#0b0c10", "#1c1c2b"]})
                 s_out.setdefault("entrance", "rise")
                 out_scenes.append(s_out)
-            if i + _BATCH_SIZE < total:
+            if i + batch_size < total:
                 time.sleep(_BATCH_PAUSE)
     return out_scenes, failures
 
@@ -783,7 +874,7 @@ def _safe_name(name: str) -> str:
 async def generate_lyrics(
     file: UploadFile = File(...),
     lyrics: str = Form(...),
-    model_name: str = Form("fast"),
+    model_name: str = Form("max"),
     language: str = Form("ru"),
 ):
     lyrics = (lyrics or "").strip()
@@ -801,10 +892,13 @@ async def generate_lyrics(
     finally:
         await file.close()
 
-    # 2. Whisper word timings
+    # 2. Whisper word timings — feed the user's own lyrics as initial_prompt
+    #    so Whisper's tokenizer favors the exact words of the song (proper
+    #    nouns, slang, Russian/English mix), giving tighter alignments.
     t0 = time.monotonic()
     try:
-        whisper_words = transcribe_words(file_path, language or None)
+        prompt_hint = lyrics[:900] if lyrics else None
+        whisper_words = transcribe_words(file_path, language or None, prompt_hint)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Whisper error: {exc}")
     whisper_ms = int((time.monotonic() - t0) * 1000)

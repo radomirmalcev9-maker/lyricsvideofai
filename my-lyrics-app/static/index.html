@@ -131,12 +131,29 @@
           font-size:72px;font-weight:800;line-height:1.1;letter-spacing:-.03em;
           text-shadow:0 6px 30px rgba(0,0,0,.55);min-height:320px;}
   .lyrics .line{display:block;}
-  .lyrics .word{display:inline-block;white-space:pre;transition:color .15s linear,transform .2s cubic-bezier(.22,1,.36,1);
-                color:rgba(255,255,255,.2);}
-  .lyrics .word.said{color:#fff;}
-  .lyrics .word.cur{color:var(--accent,#0a84ff);transform:translateY(-4px) scale(1.04);}
+  .lyrics .word{display:inline-block;white-space:pre;
+                transition:color .18s linear, transform .25s cubic-bezier(.22,1,.36,1),
+                           text-shadow .25s ease, filter .25s ease;
+                color:rgba(255,255,255,.2);
+                padding:0 .02em;margin:0 .02em;border-radius:8px;
+                will-change:transform,color,text-shadow;}
+  .lyrics .word.said{color:#fff; text-shadow:0 2px 18px rgba(0,0,0,.35);}
+  .lyrics .word.cur{color:#fff;
+                    transform:translateY(-8px) scale(1.12);
+                    text-shadow:0 0 22px var(--accent,#0a84ff),
+                                0 0 6px var(--accent,#0a84ff),
+                                0 6px 24px rgba(0,0,0,.6);
+                    filter:drop-shadow(0 0 12px var(--accent,#0a84ff));}
   .lyrics.light .word{color:rgba(0,0,0,.25);}
-  .lyrics.light .word.said{color:#0b0c10;}
+  .lyrics.light .word.said{color:#0b0c10; text-shadow:0 2px 14px rgba(0,0,0,.12);}
+  .lyrics.light .word.cur{color:#0b0c10;
+                          text-shadow:0 0 22px var(--accent,#0a84ff),
+                                      0 0 6px var(--accent,#0a84ff);
+                          filter:drop-shadow(0 0 10px var(--accent,#0a84ff));}
+  /* Smooth crossfade between scenes: outgoing scene fades out, incoming rises in */
+  .widget-slot,.lyrics{transition:opacity .35s ease;}
+  .widget-slot.swap-out,.lyrics.swap-out{opacity:0;}
+  .widget-slot.swap-in,.lyrics.swap-in{opacity:1;}
 
   @keyframes rise{from{transform:translateY(30px);opacity:0}to{transform:translateY(0);opacity:1}}
   @keyframes slide{from{transform:translateX(60px);opacity:0}to{transform:translateX(0);opacity:1}}
@@ -229,7 +246,7 @@
       <div class="row">
         <select id="modelSel" title="Модель LLM">
           <option value="fast">⚡ Быстрая (fast)</option>
-          <option value="max">🧠 Сильная (max)</option>
+          <option value="max" selected>🧠 Сильная (max)</option>
           <option value="claude-opus-4-6">Claude Opus 4</option>
           <option value="claude-sonnet-4-6">Claude Sonnet 4</option>
           <option value="gpt-5">GPT-5</option>
@@ -523,6 +540,26 @@ audio.addEventListener('play',  () => { if(!_rafId) _rafId = requestAnimationFra
 audio.addEventListener('play', () => { $('#playBtn').textContent = '❚❚'; });
 audio.addEventListener('pause', () => { $('#playBtn').textContent = '▶'; });
 $('#playBtn').addEventListener('click', () => { if (audio.paused) audio.play(); else audio.pause(); });
+// Keyboard shortcuts: Space=play/pause, Arrows=±5s, J/L=±10s, K=play/pause, 0/Home=restart.
+document.addEventListener('keydown', (e)=>{
+  if (!currentScenes.length) return;
+  if (e.target && (e.target.tagName==='TEXTAREA'||e.target.tagName==='INPUT'||e.target.tagName==='SELECT')) return;
+  if (e.code==='Space' || e.key==='k' || e.key==='K'){ e.preventDefault(); if(audio.paused)audio.play(); else audio.pause(); return; }
+  if (e.key==='ArrowLeft'){ e.preventDefault(); audio.currentTime = Math.max(0, audio.currentTime-5); return; }
+  if (e.key==='ArrowRight'){ e.preventDefault(); audio.currentTime = Math.min(audio.duration||Infinity, audio.currentTime+5); return; }
+  if (e.key==='j'||e.key==='J'){ audio.currentTime = Math.max(0, audio.currentTime-10); return; }
+  if (e.key==='l'||e.key==='L'){ audio.currentTime = Math.min(audio.duration||Infinity, audio.currentTime+10); return; }
+  if (e.key==='Home' || e.key==='0'){ audio.currentTime = 0; return; }
+});
+// When the user seeks (scrubber, arrow keys, clicking a scene), reset cached
+// karaoke state so words re-light correctly from the new position.
+audio.addEventListener('seeked', () => {
+  _lastActiveIdx = -1;
+  _curWordIdx = -1;
+  _cachedWordEls = currentScenes.length ? lyricsEl.querySelectorAll('.word') : null;
+  const idx = findSceneAt(audio.currentTime);
+  if (idx !== -1) applyScene(idx);
+});
 
 /* ---- Minimal MP4 export via canvas (real widgets rasterized via SVG foreignObject) ---- */
 exportBtn.addEventListener('click', startExport);
@@ -642,8 +679,10 @@ async function startExport(){
   }catch(e){ console.warn('audio export fallback', e); }
   const mime = ['video/mp4;codecs=h264,aac','video/webm;codecs=vp9,opus','video/webm'].find(m=>MediaRecorder.isTypeSupported(m))||'';
   const chunks = [];
-  // Higher bitrate for Retina (2x) frames so widget detail/text aren't crushed by compression.
-  const rec = new MediaRecorder(vidStream, mime?{mimeType:mime,videoBitsPerSecond:16_000_000}:undefined);
+  // Cinematic-quality bitrate for Retina (2x) frames so fine widget detail,
+  // text and glow survive compression. 24 Mbps at 30fps is roughly broadcast
+  // social-media quality; still produces reasonable file sizes for a 3-4 min track.
+  const rec = new MediaRecorder(vidStream, mime?{mimeType:mime,videoBitsPerSecond:24_000_000}:undefined);
   rec.ondataavailable = e=>{ if(e.data.size) chunks.push(e.data); };
   const done = new Promise(res=>rec.onstop=res);
   audio.pause(); audio.currentTime = 0; applyScene(0); activeIdx=-1;
@@ -701,19 +740,83 @@ function _entranceScale(progress){
 
 function drawSceneToCanvas(ctx,s,t,dur,accent,widgetImg){
   const W=LOGICAL_W,H=LOGICAL_H;
-  // -- Background
+  // -- Background (gradient + type-specific overlays)
   const colors=s?.background?.colors||['#0b0c10','#1c1c2b'];
+  const bgType = s?.background?.type || 'gradient';
   const g=ctx.createLinearGradient(0,0,0,H); g.addColorStop(0,colors[0]); g.addColorStop(1,colors[1]||colors[0]);
   ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+  // Sunset: soft sun orb + warm radial wash
+  if (bgType==='sunset'){
+    const sun = ctx.createRadialGradient(W*0.5, H*0.55, 20, W*0.5, H*0.55, 900);
+    sun.addColorStop(0,'rgba(255,180,80,.55)');
+    sun.addColorStop(0.35,'rgba(255,100,120,.25)');
+    sun.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=sun; ctx.fillRect(0,0,W,H);
+  }
+  // Rain: diagonal streaks
+  if (bgType==='rain'){
+    ctx.save();
+    ctx.strokeStyle='rgba(180,210,255,.35)';
+    ctx.lineWidth=1.5;
+    const seedShift = (t*380) % 60;
+    for (let i=0;i<90;i++){
+      const rx = ((i*137 + seedShift) % (W+200)) - 100;
+      const ry = ((i*211 + seedShift*2) % (H+200)) - 100;
+      ctx.beginPath();
+      ctx.moveTo(rx, ry);
+      ctx.lineTo(rx-18, ry+52);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // Light: subtle sunburst top-right
+  if (bgType==='light'){
+    const burst = ctx.createRadialGradient(W*0.85, 120, 10, W*0.85, 120, 900);
+    burst.addColorStop(0,'rgba(255,255,255,.5)');
+    burst.addColorStop(1,'rgba(255,255,255,0)');
+    ctx.fillStyle=burst; ctx.fillRect(0,0,W,H);
+  }
+
+  // Global vignette (slightly stronger for darker themes)
   const vg=ctx.createRadialGradient(W/2,H*.45,200,W/2,H*.45,1200);
-  vg.addColorStop(0,'rgba(0,0,0,0)');vg.addColorStop(1,'rgba(0,0,0,.55)');
+  vg.addColorStop(0,'rgba(0,0,0,0)');
+  vg.addColorStop(1, s?.theme==='light'?'rgba(0,0,0,.25)':'rgba(0,0,0,.5)');
   ctx.fillStyle=vg; ctx.fillRect(0,0,W,H);
 
-  // -- Status bar
+  // -- Status bar (live clock + signal/wifi/battery drawn with shapes)
   ctx.fillStyle=s?.theme==='light'?'#0b0c10':'#fff';
-  ctx.font='600 40px -apple-system, sans-serif'; ctx.fillText('3:14',84,84);
-  // Dynamic Island pill
+  ctx.font='600 38px -apple-system, "SF Pro Display", sans-serif';
+  ctx.textBaseline='middle';
+  const now = new Date();
+  const hh = now.getHours().toString().padStart(2,'0');
+  const mm = now.getMinutes().toString().padStart(2,'0');
+  ctx.fillText(hh+':'+mm, 74, 58);
+  // Right side icons (drawn as shapes; emoji render inconsistently on canvas)
+  ctx.save();
+  const sx = W - 240;
+  // 4 signal bars
+  for (let i=0;i<4;i++){ const bh=6+i*5; ctx.fillRect(sx+i*10, 78-bh, 6, bh); }
+  // Wi-Fi wedge arc
+  ctx.beginPath(); ctx.arc(sx+66,86,16,Math.PI*1.15,Math.PI*1.85); ctx.lineWidth=4; ctx.strokeStyle=ctx.fillStyle; ctx.stroke();
+  // Battery outline + tip + level
+  ctx.lineWidth=3; roundRect(ctx,sx+100,60,46,22,5); ctx.stroke();
+  ctx.fillRect(sx+148,67,4,8);
+  ctx.fillRect(sx+104,64,34,14);
+  ctx.restore();
+  ctx.textBaseline='alphabetic';
+
+  // Dynamic Island (black pill) with a subtle pulsing mic/cam dot during scenes
   ctx.fillStyle='#000'; roundRect(ctx,W/2-150,20,300,70,35); ctx.fill();
+  // Tiny green camera dot on the right side of the island
+  const dotA = 0.6 + 0.4*Math.sin(t*3.5);
+  ctx.save();
+  ctx.globalAlpha = dotA;
+  ctx.fillStyle = '#30d158';
+  ctx.beginPath(); ctx.arc(W/2+112,55,6,0,Math.PI*2); ctx.fill();
+  ctx.shadowColor='#30d158'; ctx.shadowBlur=14;
+  ctx.beginPath(); ctx.arc(W/2+112,55,4,0,Math.PI*2); ctx.fill();
+  ctx.restore();
 
   // -- Karaoke text (word-by-word karaoke highlighting)
   if (s && s.words){
@@ -729,29 +832,39 @@ function drawSceneToCanvas(ctx,s,t,dur,accent,widgetImg){
       }else{
         fill = isCur?accent:isDone?'#fff':'rgba(255,255,255,.28)';
       }
-      ctx.fillStyle = fill;
-      // Pop current word up slightly (matches live CSS .cur { transform: translateY(-4px) scale(1.04) })
       let yy = y;
       let scale = 1.0;
+      let glow = 0;
       if (isCur){
-        // Ease the pop in/out over the word duration
         const wd = Math.max(0.001, w.end - w.start);
         const localT = Math.max(0, Math.min(1, (t - w.start)/wd));
-        const bump = Math.sin(localT*Math.PI) * 6;
-        yy -= bump;
-        scale = 1 + Math.sin(localT*Math.PI)*0.04;
+        const k = Math.sin(localT*Math.PI);
+        yy -= k*8;
+        scale = 1 + k*0.06;
+        glow = k;
       }
       const text = w.word;
-      const ww = ctx.measureText(text+' ').width;
+      const spaceW = ctx.measureText(' ').width;
+      ctx.font='800 72px -apple-system, "SF Pro Display", BlinkMacSystemFont, sans-serif';
+      const ww = ctx.measureText(text).width + spaceW;
       if (x+ww > W-80){ x=80; y+=lineH; yy=y; }
-      if (scale!==1){
+
+      const drawWord = (color, shadow) => {
         ctx.save();
-        ctx.translate(x+ww/2, yy);
-        ctx.scale(scale, scale);
-        ctx.fillText(text, -ww/2, 0);
+        ctx.fillStyle = color;
+        if (shadow) { ctx.shadowColor = accent; ctx.shadowBlur = 24*glow; }
+        if (scale!==1){ ctx.translate(x+ww/2-spaceW/2, yy); ctx.scale(scale,scale); ctx.fillText(text, -(ww-spaceW)/2, 0); }
+        else          { ctx.fillText(text, x, yy); }
         ctx.restore();
+      };
+
+      if (isCur && glow>0){
+        // 1) glow halo in accent color
+        drawWord(accent, true);
+        // 2) bright crisp word on top
+        drawWord(s.theme==='light' ? '#0b0c10' : '#fff', false);
       }else{
-        ctx.fillText(text, x, yy);
+        drawWord(fill, false);
       }
       x += ww;
     });
