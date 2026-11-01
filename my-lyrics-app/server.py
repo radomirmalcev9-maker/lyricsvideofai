@@ -340,6 +340,7 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
                 rec["match"] = round(_word_similarity(n, wn), 3)
         scenes[li]["words"].append(rec)
 
+    # --- 7. Build initial raw start/end per scene ---
     for sc in scenes:
         if not sc["words"]:
             sc["start"] = 0.0
@@ -347,6 +348,64 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
             continue
         sc["start"] = sc["words"][0]["start"]
         sc["end"]   = round(sc["words"][-1]["end"] + 0.15, 3)
+
+    # --- 8. Guarantee scene boundaries form a strict non-overlapping,
+    #        monotonic partition of the timeline. This is what prevents
+    #        the "scene skipped" bug the user reported. Without this step,
+    #        when Whisper misaligns one line's last word after the next
+    #        line's first word, two scene intervals can overlap or leave
+    #        a gap, and the renderer's findIndex returns -1 on the gap
+    #        (stale scene shown) or picks the wrong overlapping scene.
+    eps = 0.001
+    # First pass: make sure every scene has start <= end and scenes are
+    # monotonically non-decreasing in start time.
+    for idx, sc in enumerate(scenes):
+        if sc["end"] < sc["start"]:
+            sc["end"] = round(sc["start"] + 0.3, 3)
+        if idx > 0 and sc["start"] < scenes[idx - 1]["start"]:
+            sc["start"] = scenes[idx - 1]["start"]
+            if sc["end"] < sc["start"]:
+                sc["end"] = round(sc["start"] + 0.3, 3)
+
+    # Second pass: resolve overlaps. When scene N ends after scene N+1
+    # starts, split the gap/overlap at the midpoint so each scene owns a
+    # contiguous chunk and no time t belongs to two scenes.
+    for idx in range(len(scenes) - 1):
+        a, b = scenes[idx], scenes[idx + 1]
+        if a["end"] > b["start"] - eps:
+            # Overlap or near-touching: put the boundary at the midpoint
+            # between a.last_word.start and b.first_word.start if those are
+            # sanely ordered, otherwise bisect the overlap interval.
+            a_last_start = a["words"][-1]["start"] if a["words"] else a["end"]
+            b_first_start = b["words"][0]["start"] if b["words"] else b["start"]
+            if b_first_start > a_last_start + eps:
+                mid = round((a_last_start + b_first_start) / 2, 3)
+            else:
+                mid = round((a["start"] + b["end"]) / 2, 3)
+            # Guard: mid must stay inside [a.start, b.end] and preserve order
+            mid = max(a["start"] + 0.05, min(mid, b["end"] - 0.05))
+            a["end"] = round(mid, 3)
+            b["start"] = round(mid + eps, 3)
+            if b["end"] <= b["start"]:
+                b["end"] = round(b["start"] + 0.3, 3)
+
+    # Third pass: fill gaps — if there is time between end[N] and start[N+1],
+    # extend end[N] to close the gap so no t is left uncovered. This gives
+    # the viewer a continuous karaoke flow instead of a frozen frame.
+    for idx in range(len(scenes) - 1):
+        a, b = scenes[idx], scenes[idx + 1]
+        if b["start"] > a["end"] + eps:
+            a["end"] = round(b["start"] - eps, 3)
+
+    # Final sanity clamp: ensure every word's start/end lies within its scene.
+    for sc in scenes:
+        for w in sc["words"]:
+            if w["start"] < sc["start"]:
+                w["start"] = sc["start"]
+            if w["end"] > sc["end"]:
+                w["end"] = sc["end"]
+            if w["end"] < w["start"]:
+                w["end"] = round(w["start"] + 0.05, 3)
 
     return scenes
 
@@ -614,7 +673,11 @@ def ask_arena(all_scenes: list[dict], model: str | None) -> tuple[list[dict], li
         for s in all_scenes
     ]
 
-    options = AutoOptions(fast_model=model is None)
+    # archive_after_answer=True tells arena-api to click “…→ Archive” on
+    # each conversation once the model's answer is fully received, so the
+    # per-batch client.complete() calls don't leave orphaned single-turn
+    # chats littering the user's Arena sidebar.
+    options = AutoOptions(fast_model=model is None, archive_after_answer=True)
     out_scenes: list[dict] = []
     total = len(all_scenes)
     with auto_direct_client(options, verification_token="auto") as client:
