@@ -122,7 +122,6 @@ def transcribe_words(audio_path: Path, language: str | None = None) -> list[dict
         str(audio_path),
         language=language,
         word_timestamps=True,
-        vad_filter=True,
         # Don't let VAD chop off word tails at line boundaries.
         vad_filter=False,
     )
