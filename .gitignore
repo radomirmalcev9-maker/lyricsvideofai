@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Uploaded media and generated state
+my-lyrics-app/static/uploads/
+my-lyrics-app/static/state/
+
+# Reference analysis artifacts (large binaries + extracted frames)
+reference_videos/
+reference_frames/
+extract_frames.py
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Playwright
+.playwright/
+
+# Whisper model cache (downloaded at runtime)
+.cache/
