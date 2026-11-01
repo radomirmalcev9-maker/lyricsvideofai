@@ -143,15 +143,31 @@
   @keyframes fade{from{opacity:0}to{opacity:1}}
   @keyframes pop{from{transform:scale(.85);opacity:0}to{transform:scale(1);opacity:1}}
 
-  /* Widget slot — pure HTML/CSS from the LLM gets injected here */
-  .widget-slot{position:absolute;top:900px;left:80px;right:80px;min-height:520px;
-               z-index:8;transform:perspective(1600px) rotateX(6deg) rotateY(-3deg);
-               transform-origin:center top;}
-  .widget-slot .w{animation:rise .4s cubic-bezier(.22,1,.36,1) both;}
+  /* Widget slot — pure HTML/CSS from the LLM gets injected here.
+     We force injected cards to FILL the slot completely so the AI's
+     820x520 card is never a small box floating inside a bigger glass area.
+     3D perspective was removed: it triggers expensive layer re-paints on
+     every word transition and was the #1 source of playback lag. */
+  .widget-slot{position:absolute;top:900px;left:80px;right:80px;
+               width:calc(100% - 160px);height:600px;
+               z-index:8;contain:layout paint style;}
+  /* Force the injected .w to stretch to the slot. Using !important to
+     override whatever the LLM emits (fixed widths, margins, flex centering
+     that would leave gaps). */
+  .widget-slot .w{box-sizing:border-box !important;
+                  width:100% !important;
+                  min-height:600px !important;height:100% !important;
+                  max-width:none !important;
+                  margin:0 !important;
+                  display:flex !important;flex-direction:column !important;
+                  animation:rise .4s cubic-bezier(.22,1,.36,1) both;
+                  will-change:transform,opacity;}
   .widget-slot.anim-rise  .w{animation:rise .45s cubic-bezier(.22,1,.36,1) both;}
   .widget-slot.anim-slide .w{animation:slide .45s cubic-bezier(.22,1,.36,1) both;}
   .widget-slot.anim-fade  .w{animation:fade .5s ease both;}
   .widget-slot.anim-pop   .w{animation:pop .45s cubic-bezier(.22,1,.36,1) both;}
+  /* Anchor any absolute-positioned children to the card (not the viewport). */
+  .widget-slot .w, .widget-slot{position:relative;}
 
   /* Mini player */
   .miniplayer{position:absolute;left:40px;right:40px;bottom:56px;height:140px;
@@ -337,7 +353,7 @@ async function generate(){
     audio.src = data.audio_url;
     miniplayer.style.display = 'flex';
     $('#mpTitle').textContent = lastFile.name.replace(/\.[^.]+$/,'');
-    $('#mpArtist').textContent = (data.stub_mode ? '⚠ STUB · ' : '') + (modelSel.options[modelSel.selectedIndex]?.text || '');
+    $('#mpArtist').textContent = (data.stub_mode ? '⚠ STUB · Lyrics Video' : 'Lyrics Video');
     renderScenesGrid();
     applyScene(0);
     const okMsg = 'Готово: '+currentScenes.length+' сцен · Whisper '+data.timings_ms.whisper+'ms · Arena '+data.timings_ms.arena+'ms';
@@ -445,31 +461,65 @@ function findSceneAt(t){
   return best;
 }
 
-/* Playback sync */
-audio.addEventListener('timeupdate', () => {
+/* Playback sync.
+ * Performance notes:
+ *   - We use requestAnimationFrame instead of 'timeupdate' (which only fires
+ *     ~4/sec and makes karaoke feel laggy). RAF ticks with the display
+ *     refresh (~60/s), driven by audio.currentTime as the source of truth.
+ *   - wordEls is cached per scene — no querySelectorAll on every frame.
+ *   - Word state is incremental: we only mutate words whose state actually
+ *     changed relative to the last frame, avoiding layout thrash from
+ *     adding/removing the same classes each tick.
+ */
+let _rafId = null, _cachedWordEls = null, _curWordIdx = -1;
+function tickPlayback(){
+  if (!currentScenes.length){ _rafId = requestAnimationFrame(tickPlayback); return; }
   const t = audio.currentTime;
   const idx = findSceneAt(t);
-  if (idx !== -1) applyScene(idx);
-  // Per-word karaoke
-  const s = currentScenes[idx];
-  if (s && s.words){
-    const wordEls = lyricsEl.querySelectorAll('.word');
-    let cur = -1;
-    s.words.forEach((w,i) => {
-      const el = wordEls[i]; if (!el) return;
-      el.classList.remove('cur');
-      if (t < w.start){ el.classList.remove('said'); }
-      else if (t >= w.end){ el.classList.add('said'); }
-      else { el.classList.add('said','cur'); cur = i; }
-    });
+  if (idx !== -1 && idx !== activeIdx){
+    applyScene(idx);
+    _cachedWordEls = lyricsEl.querySelectorAll('.word');
+    _curWordIdx = -1;
   }
-  // Mini player
+  const s = currentScenes[idx];
+  if (s && s.words && _cachedWordEls){
+    const words = s.words;
+    // Find current word via forward scan from previous position (cheap).
+    let newCur = -1;
+    for (let i=Math.max(0,_curWordIdx); i<words.length; i++){
+      if (t >= words[i].start && t < words[i].end){ newCur = i; break; }
+      if (words[i].end <= t && i < words.length-1 && t < words[i+1].start){ newCur = i; break; }
+      if (i === words.length-1 && t >= words[i].start){ newCur = i; break; }
+    }
+    if (newCur !== _curWordIdx){
+      // Undo previous 'cur'
+      if (_curWordIdx >= 0 && _cachedWordEls[_curWordIdx]){
+        _cachedWordEls[_curWordIdx].classList.remove('cur');
+      }
+      // Mark all words up to newCur as 'said', the rest as not, and flag newCur as 'cur'
+      for (let i=0;i<words.length;i++){
+        const el = _cachedWordEls[i]; if (!el) continue;
+        const wasSaid = el.classList.contains('said');
+        const wasCur  = el.classList.contains('cur');
+        const isSaid  = (i <= newCur) || t >= words[i].end;
+        const isCur   = (i === newCur);
+        if (isSaid !== wasSaid){ el.classList.toggle('said', isSaid); }
+        if (isCur  !== wasCur) { el.classList.toggle('cur',  isCur); }
+      }
+      _curWordIdx = newCur;
+    }
+  }
+  // Mini player (lightweight DOM updates)
   if (audio.duration){
     $('#mpBar').style.width = (t/audio.duration*100)+'%';
     $('#mpCur').textContent = fmt(t);
     $('#mpRem').textContent = '-'+fmt(Math.max(0,audio.duration-t));
   }
-});
+  _rafId = requestAnimationFrame(tickPlayback);
+}
+_rafId = requestAnimationFrame(tickPlayback);
+audio.addEventListener('pause', () => { if(_rafId){ cancelAnimationFrame(_rafId); _rafId=null; } });
+audio.addEventListener('play',  () => { if(!_rafId) _rafId = requestAnimationFrame(tickPlayback); });
 audio.addEventListener('play', () => { $('#playBtn').textContent = '❚❚'; });
 audio.addEventListener('pause', () => { $('#playBtn').textContent = '▶'; });
 $('#playBtn').addEventListener('click', () => { if (audio.paused) audio.play(); else audio.pause(); });
@@ -501,6 +551,9 @@ function rasterizeWidget(widgetHtml, theme) {
   const txtColor = theme==='light'?'#0b0c10':'#fff';
   // Tell the inner content to lay itself out at 2x (like a Retina screen),
   // then scale down visually so shapes/text stay sharp.
+  // IMPORTANT: mirror the live-preview CSS that forces .w to fill the slot
+  // — without this, widgets rasterize at their intrinsic 820x520 and look
+  // small in the middle of the glass card.
   const baseCss = `
     *{box-sizing:border-box;}
     html,body{margin:0;padding:0;width:${W}px;height:${H}px;
@@ -509,10 +562,12 @@ function rasterizeWidget(widgetHtml, theme) {
          -moz-osx-font-smoothing:grayscale;
          text-rendering:optimizeLegibility;
          color:${txtColor};background:transparent;overflow:hidden;
-         display:flex;align-items:center;justify-content:center;}
-    .w{transform-origin:center center;
-       /* Center the 820px-wide logical card inside the 2x raster surface: */
-       margin:0 auto;}
+         display:flex;align-items:stretch;justify-content:stretch;}
+    .w{box-sizing:border-box;
+       width:100% !important;min-height:100% !important;height:100% !important;
+       max-width:none !important;margin:0 !important;
+       display:flex !important;flex-direction:column !important;
+       transform-origin:center center;}
   `;
   // foreignObject needs an explicit size in SVG CSS pixels; we let the SVG
   // itself be at logical size and scale its contents via viewBox.
@@ -592,18 +647,26 @@ async function startExport(){
   rec.ondataavailable = e=>{ if(e.data.size) chunks.push(e.data); };
   const done = new Promise(res=>rec.onstop=res);
   audio.pause(); audio.currentTime = 0; applyScene(0); activeIdx=-1;
+  // Pause the live preview RAF loop during export — it's not needed and
+  // doubles the work.
+  if (_rafId){ cancelAnimationFrame(_rafId); _rafId = null; }
   rec.start();
   exportStatus.textContent='Рендер… 0%';
   const dur = audio.duration || (currentScenes[currentScenes.length-1]?.end ?? 0);
   const t0 = performance.now();
   let stopped = false;
+  let lastPaint = 0;
+  const FRAME_MS = 1000/30; // 30fps export is enough for lyrics and halves CPU
   function paint(now){
     const t = (now-t0)/1000;
     if (t >= dur){ if(!stopped){stopped=true;rec.stop(); if(mediaSrc)try{mediaSrc.src.stop();}catch(e){}} return; }
     const idx = findSceneAt(t);
     if (idx!==-1 && idx!==activeIdx) applyScene(idx);
-    drawSceneToCanvas(ctx, currentScenes[idx], t, dur, accentFor(currentScenes[idx]),
-                      _WIDGET_IMG_CACHE.get(currentScenes[idx]?.scene_id) || null);
+    if (now - lastPaint >= FRAME_MS || lastPaint === 0){
+      drawSceneToCanvas(ctx, currentScenes[idx], t, dur, accentFor(currentScenes[idx]),
+                        _WIDGET_IMG_CACHE.get(currentScenes[idx]?.scene_id) || null);
+      lastPaint = now;
+    }
     exportStatus.textContent = 'Рендер… '+Math.round(t/dur*100)+'%';
     requestAnimationFrame(paint);
   }
@@ -618,6 +681,8 @@ async function startExport(){
   setTimeout(()=>URL.revokeObjectURL(url),2000);
   _WIDGET_IMG_CACHE.clear();
   exportProgress.classList.remove('show'); exportBtn.disabled=false;
+  // Resume the live playback RAF loop.
+  if (!_rafId) _rafId = requestAnimationFrame(tickPlayback);
 }
 function accentFor(s){return s?.accent||'#0a84ff';}
 
@@ -729,18 +794,16 @@ function drawSceneToCanvas(ctx,s,t,dur,accent,widgetImg){
   if (widgetImg){
     ctx.save();
     roundRect(ctx, widgetX, widgetY, widgetW, widgetH, 60); ctx.clip();
-    // The rasterized image is at _WIDGET_DPR (2x); its logical size is stored
-    // in _lw/_lh so we draw at the intended logical dimensions (crisp on Retina).
+    // Rasterized image is at _WIDGET_DPR; logical size in _lw/_lh.
+    // Fill the ENTIRE card slot (COVER-style) so the widget doesn't sit as a
+    // small centered box. This mirrors what the CSS !important rules do in
+    // the live preview slot.
     const lw = widgetImg._lw || widgetW;
     const lh = widgetImg._lh || widgetH;
-    // The LLM's card is 820x520 (padded). Fit it inside our 920x600 card slot
-    // with a little inset so it doesn't touch the glass edges.
-    const scale = Math.min(widgetW/lw, widgetH/lh) * 0.94;
+    const scale = Math.max(widgetW/lw, widgetH/lh);
     const dw = lw*scale, dh = lh*scale;
     const dx = widgetX + (widgetW - dw)/2;
     const dy = widgetY + (widgetH - dh)/2;
-    // imageSmoothingQuality='high' is honoured by Chromium for SVG images and
-    // yields sharper text/curves.
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(widgetImg, dx, dy, dw, dh);
