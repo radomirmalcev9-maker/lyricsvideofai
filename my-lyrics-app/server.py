@@ -95,7 +95,25 @@ _PUNCT_RE = re.compile(r"[^\w0-9а-яА-ЯёЁa-zA-Z]+", flags=re.UNICODE)
 
 
 def _norm(s: str) -> str:
-    return _PUNCT_RE.sub("", (s or "").lower()).strip()
+    """Aggressive normalization for fuzzy matching (case, punctuation, ё→е, ъ/ь)."""
+    t = _PUNCT_RE.sub("", (s or "").lower())
+    t = t.replace("ё", "е")
+    # Drop soft/hard signs for Russian (Whisper often omits them).
+    t = t.replace("ъ", "").replace("ь", "")
+    return t.strip()
+
+
+def _word_similarity(a: str, b: str) -> float:
+    """Return 0..1 similarity between two NORMALIZED words."""
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    # One is prefix/suffix of the other (e.g. Whisper glued two words).
+    if len(a) >= 3 and len(b) >= 3:
+        if a.startswith(b) or b.startswith(a) or a.endswith(b) or b.endswith(a):
+            return min(len(a), len(b)) / max(len(a), len(b)) * 0.92
+    return difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def transcribe_words(audio_path: Path, language: str | None = None) -> list[dict]:
@@ -105,6 +123,8 @@ def transcribe_words(audio_path: Path, language: str | None = None) -> list[dict
         language=language,
         word_timestamps=True,
         vad_filter=True,
+        # Don't let VAD chop off word tails at line boundaries.
+        vad_filter=False,
     )
     words: list[dict] = []
     for seg in segments:
@@ -122,78 +142,213 @@ def transcribe_words(audio_path: Path, language: str | None = None) -> list[dict
 
 
 def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
+    """Globally align user-supplied lyrics lines to Whisper word timings.
+
+    Algorithm:
+      1. Tokenize the lyrics into (line_index, raw_token), keeping punctuation
+         tokens attached to their line but flagging them.
+      2. Build a sequence of "real" (non-punct) lyrics tokens and a matching
+         sequence of Whisper words (already normalized).
+      3. Run a Needleman-Wunsch-style global DP alignment between the two
+         sequences (match/mismatch cost by word similarity; linear gap
+         penalties for insertions/deletions on either side). This guarantees
+         the alignment is globally optimal AND monotonic — no more "one
+         missed word shifts everything after it" bug.
+      4. Backtrace to find the 1-to-1 pairs (lyrics_token_idx ↔ whisper_idx).
+      5. Interpolate timings for tokens with no matched whisper word
+         (punctuation, missed words, repeated articles) linearly between
+         their nearest matched neighbors.
+      6. Group tokens back into lines to produce scenes.
+    """
+    # --- 1. Tokenize lyrics preserving line breaks ---
     lines_raw = [ln.strip() for ln in lyrics_text.splitlines()]
     lines_raw = [ln for ln in lines_raw if ln]
 
-    tokens: list[tuple[int, str]] = []
+    TokRec = tuple  # (line_idx, raw_text, norm_text, is_punct)
+    tokens: list[tuple[int, str, str, bool]] = []
     for li, line in enumerate(lines_raw):
         for tok in re.split(r"(\s+)", line):
             if not tok or tok.isspace():
                 continue
-            tokens.append((li, tok))
+            n = _norm(tok)
+            tokens.append((li, tok, n, not n))  # punct-only token if normalized is empty
 
+    # Real-word tokens only (punctuation has no Whisper counterpart).
+    real_positions = [i for i, t in enumerate(tokens) if not t[3]]
+    if not whisper_words or not real_positions:
+        # Fallback: zero-length scenes.
+        return [{"line": ln, "words": [], "start": 0.0, "end": 0.0} for ln in lines_raw]
+
+    # --- 2. Prepare sequences ---
+    N = len(real_positions)          # lyrics real words
+    M = len(whisper_words)           # whisper words
+    lyrics_norms = [tokens[k][2] for k in real_positions]
+    whisper_norms = [w["norm"] for w in whisper_words]
+
+    # DP score matrix. We maximize similarity, with a fixed penalty per gap.
+    # GAP_OPEN penalizes skipping a word on either side. Lower it so the
+    # aligner is willing to skip filler/hesitation words Whisper invents.
+    GAP_PEN = -0.45
+    MATCH_MULT = 1.0  # weight of similarity score for a pair
+    # dp[i][j] = best score aligning first i lyrics words to first j whisper words
+    dp: list[list[float]] = [[0.0] * (M + 1) for _ in range(N + 1)]
+    # back: 'D' = diagonal (match), 'U' = up (skip whisper, j-1), 'L' = left (skip lyrics, i-1)
+    bt: list[list[str]] = [[""] * (M + 1) for _ in range(N + 1)]
+    NEG_INF = float("-inf")
+    for i in range(1, N + 1):
+        dp[i][0] = dp[i - 1][0] + GAP_PEN
+        bt[i][0] = "L"
+    for j in range(1, M + 1):
+        dp[0][j] = dp[0][j - 1] + GAP_PEN * 0.6  # slightly cheaper to skip whisper fillers
+        bt[0][j] = "U"
+
+    # Banded DP: only consider |i/M - j/N| < BAND relative to diagonal to keep
+    # things O((N+M)*BAND). Russian lyrics have ~same number of words as Whisper
+    # sees, so a generous band of ±80 covers bridges/hesitations safely.
+    BAND = 120
+
+    for i in range(1, N + 1):
+        j_lo = max(1, int(i * M / N) - BAND)
+        j_hi = min(M, int(i * M / N) + BAND)
+        for j in range(j_lo, j_hi + 1):
+            sim = _word_similarity(lyrics_norms[i - 1], whisper_norms[j - 1])
+            match_score = dp[i - 1][j - 1] + MATCH_MULT * sim
+            # Skip a lyrics word (deletion in Whisper)
+            skipL = dp[i - 1][j] + GAP_PEN if bt[i - 1][j] else NEG_INF
+            # Skip a whisper word (insertion/filler)
+            skipU = dp[i][j - 1] + GAP_PEN * 0.6 if bt[i][j - 1] else NEG_INF
+            best = max(match_score, skipL, skipU)
+            dp[i][j] = best
+            if best == match_score:
+                bt[i][j] = "D"
+            elif best == skipL:
+                bt[i][j] = "L"
+            else:
+                bt[i][j] = "U"
+        # Make sure all columns have reachable values (fill out of band with NEG_INF)
+        for j in range(0, M + 1):
+            if not bt[i][j] and j != 0:
+                dp[i][j] = NEG_INF
+
+    # --- 4. Backtrace from (N, M) ---
+    pairs: dict[int, int] = {}  # lyrics_real_index -> whisper_index
+    i, j = N, M
+    # If endpoint is unreachable (extremely rare), find the best reachable cell on row N or col M.
+    if dp[i][j] == NEG_INF:
+        best_v = NEG_INF
+        best_ij = (N, M)
+        for jj in range(0, M + 1):
+            if dp[N][jj] > best_v:
+                best_v = dp[N][jj]; best_ij = (N, jj)
+        for ii in range(0, N + 1):
+            if dp[ii][M] > best_v:
+                best_v = dp[ii][M]; best_ij = (ii, M)
+        i, j = best_ij
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and bt[i][j] == "D":
+            pairs[i - 1] = j - 1
+            i -= 1; j -= 1
+        elif i > 0 and bt[i][j] == "L":
+            i -= 1  # lyrics word not found in whisper
+        elif j > 0 and bt[i][j] == "U":
+            j -= 1  # whisper word unused
+        else:
+            break
+
+    # --- 5. Assign times to every token (real words + punctuation) ---
+    # Build a list of (token_idx_absolute, start, end) for real aligned words.
+    anchor: list[tuple[int, float, float]] = []
+    for ri, tk_idx in enumerate(real_positions):
+        wi = pairs.get(ri)
+        if wi is None:
+            continue
+        w = whisper_words[wi]
+        anchor.append((tk_idx, float(w["start"]), float(w["end"])))
+
+    # Sort anchors by time (should already be monotonic by DP construction).
+    anchor.sort(key=lambda x: x[1])
+
+    # Fallback anchor if nothing aligned (degenerate).
+    if not anchor:
+        t0 = 0.0
+        for tk_idx, (li, raw, n, is_punct) in enumerate(tokens):
+            anchor.append((tk_idx, t0, t0 + 0.25))
+            t0 += 0.25
+    else:
+        # Extrapolate before first anchor and after last anchor at constant pace.
+        first_idx, first_s, first_e = anchor[0]
+        last_idx,  last_s,  last_e  = anchor[-1]
+        # Pace (seconds per token) estimated from anchors.
+        if len(anchor) >= 2:
+            span_t = last_e - first_s
+            span_n = anchor[-1][0] - first_idx + 1 or 1
+            pace = span_t / span_n
+        else:
+            pace = 0.28
+        # Pad before
+        pad = []
+        t = first_s
+        for k in range(first_idx - 1, -1, -1):
+            t -= pace
+            pad.append((k, max(0.0, t), max(0.0, t + pace)))
+        pad.reverse()
+        anchor = pad + anchor
+        # Pad after
+        t = last_e
+        pad_after = []
+        for k in range(last_idx + 1, len(tokens)):
+            pad_after.append((k, t, t + pace))
+            t += pace
+        anchor = anchor + pad_after
+
+    # Build a map token_idx -> (start, end) via linear interpolation between anchors.
+    times: dict[int, tuple[float, float]] = {}
+    for a_pos in range(len(anchor) - 1):
+        i0, s0, e0 = anchor[a_pos]
+        i1, s1, e1 = anchor[a_pos + 1]
+        times[i0] = (s0, e0)
+        gap = i1 - i0
+        if gap > 1:
+            for d in range(1, gap):
+                frac = d / gap
+                st = s0 + (s1 - s0) * frac
+                en = e0 + (e1 - e0) * frac
+                # Guard against zero/negative durations
+                if en <= st:
+                    en = st + 0.12
+                times[i0 + d] = (st, en)
+    times[anchor[-1][0]] = (anchor[-1][1], anchor[-1][2])
+
+    # Map token_idx -> real_index (for non-punct tokens)
+    tok_to_real = {tk_idx: ri for ri, tk_idx in enumerate(real_positions)}
+
+    # --- 6. Group back into scenes/lines ---
     scenes: list[dict] = [{"line": ln, "words": []} for ln in lines_raw]
-    last_real_t = {"start": 0.0, "end": 0.0}
-    w_idx = 0
-    n_w = len(whisper_words)
-
-    for li, tok in tokens:
-        n = _norm(tok)
-        if not n:
-            s = last_real_t["end"]
-            scenes[li]["words"].append({
-                "word": tok, "start": round(s, 3),
-                "end": round(s + 0.15, 3), "punct": True,
-            })
-            continue
-
-        best_j = -1
-        best_score = 0.0
-        for j in range(w_idx, min(w_idx + 80, n_w)):
-            ww = whisper_words[j]
-            wn = ww["norm"]
-            if not wn:
-                continue
-            if n == wn:
-                best_j = j
-                best_score = 1.0
-                break
-            if n.startswith(wn) or wn.startswith(n):
-                score = min(len(n), len(wn)) / max(len(n), len(wn))
-                if score > best_score:
-                    best_score = score
-                    best_j = j
-                continue
-            ratio = difflib.SequenceMatcher(None, n, wn).ratio()
-            if ratio > best_score and ratio >= 0.72:
-                best_score = ratio
-                best_j = j
-
-        if best_j == -1:
-            s = last_real_t["end"]
-            scenes[li]["words"].append({
-                "word": tok, "start": round(s, 3), "end": round(s + 0.3, 3),
-                "aligned": False,
-            })
-            last_real_t = {"start": s, "end": s + 0.3}
-            continue
-
-        w = whisper_words[best_j]
-        s, e = float(w["start"]), float(w["end"])
-        scenes[li]["words"].append({
-            "word": tok, "start": round(s, 3), "end": round(e, 3),
-            "aligned": True, "match": best_score,
-        })
-        last_real_t = {"start": s, "end": e}
-        w_idx = best_j + 1
+    for tk_idx, (li, raw, n, is_punct) in enumerate(tokens):
+        s, e = times.get(tk_idx, (0.0, 0.15))
+        rec = {
+            "word": raw,
+            "start": round(s, 3),
+            "end":   round(max(e, s + 0.05), 3),
+        }
+        if is_punct:
+            rec["punct"] = True
+        else:
+            ri = tok_to_real.get(tk_idx, -1)
+            rec["aligned"] = ri in pairs
+            if ri in pairs:
+                wn = whisper_norms[pairs[ri]]
+                rec["match"] = round(_word_similarity(n, wn), 3)
+        scenes[li]["words"].append(rec)
 
     for sc in scenes:
         if not sc["words"]:
             sc["start"] = 0.0
-            sc["end"] = 0.0
+            sc["end"]   = 0.0
             continue
         sc["start"] = sc["words"][0]["start"]
-        sc["end"] = round(sc["words"][-1]["end"] + 0.15, 3)
+        sc["end"]   = round(sc["words"][-1]["end"] + 0.15, 3)
+
     return scenes
 
 
