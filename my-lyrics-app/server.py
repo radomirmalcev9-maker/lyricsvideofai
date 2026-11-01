@@ -201,45 +201,44 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
 # Director prompt (NO templates; AI invents widget HTML from scratch per scene)
 # --------------------------------------------------------------------------- #
 
-DIRECTOR_PROMPT = """\
+DIRECTOR_SYSTEM_PROMPT = """\
 Ты — ведущий моушн-дизайнер и арт-директор вертикальных lyric-видео в стиле iOS / Apple Motion (9:16).
+Я буду присылать тебе порции сцен по несколько строк за раз (JSON-массив).
+Каждая сцена: {scene_id, start, end, line}.
+Тайминги слов мне НЕ НУЖНЫ в ответе — не включай поле words в свои объекты, чтобы экономить место.
 
-Тебе дан JSON-МАССИВ СЦЕН. Каждая сцена = одна строка трека с таймингами start/end (секунды),
-и словами words[] (каждое со своим start/end).
+Для КАЖДОЙ сцены верни ОБЪЕКТ с теми же scene_id и ДОПОЛНИТЕЛЬНО с полями:
+widget_html, theme, accent, background, entrance.
+Выход — РОВНО МАССИВ ТОЙ ЖЕ ДЛИНЫ, в ТОМ ЖЕ ПОРЯДКЕ, scene_id сохраняй.
 
-Для КАЖДОЙ сцены в этом массиве верни ОБЪЕКТ с теми же scene_id, start, end, line, words
-и ДОПОЛНИТЕЛЬНО с полями widget_html, theme, accent, background, entrance.
-ВАЖНО: на выходе должен быть РОВНО ТОТ ЖЕ МАССИВ той же длины, в том же порядке,
-scene_id и words не изменяй.
+Требования к widget_html:
+- Один self-contained фрагмент, обёртка <div class="w" style="...">...</div>.
+- Карточка ~820x520px, padding 40-60px, border-radius ~56px, полупрозрачный
+  стеклянный фон (backdrop-filter blur), как виджет iOS.
+- Шрифт системный: -apple-system, "SF Pro Display".
+- Можно <style>.w ...{...}</style> внутри карточки, анимации только CSS @keyframes (transform/opacity).
+- НЕ используй <img>, <svg> со сложной графикой, внешние шрифты. Только
+  формы (border/radial-gradient/box-shadow), линии, кружки, emoji, простые иконки.
+- НЕ вставляй текст песни в виджет (он выводится отдельно). Короткие подписи/цифры можно.
+- Виджет должен узнаваемо выглядеть как кусок интерфейса iPhone и быть СМЫСЛОВО
+  СВЯЗАН со строкой (экран звонка/удаления контакта/Apple Pay/будильник/погода/
+  карты/iMessage/Face ID/реакция/etc). Не повторяй один и тот же виджет в соседних строках.
 
-Поля, которые ты ДОБАВЛЯЕШЬ к каждой сцене:
+Остальные поля:
+* theme:      "dark" | "light"
+* accent:     hex (#0a84ff, #ff375f, #30d158, #bf5af2, ...)
+* background: {"type":"gradient"|"rain"|"sunset"|"light"|"solid", "colors":[hex,hex]}
+* entrance:   "rise"|"slide"|"fade"|"pop"
 
-* widget_html — self-contained HTML+CSS фрагмент ОДНОЙ карточки виджета.
-  - Обёртка: <div class="w" style="...">...</div>
-  - Карточка занимает прямоугольник ~820x520px с padding 40-60px,
-    border-radius ~56px, полупрозрачный фон, backdrop-filter blur
-    (стеклянная карточка iOS).
-  - Шрифт: -apple-system, "SF Pro Display", системный.
-  - Можно использовать <style>.w ...</style> внутри карточки для анимаций.
-  - Анимации только CSS @keyframes (transform/opacity).
-  - НЕ используй <img>, <svg> со сложной графикой, внешние шрифты,
-    сторонние библиотеки. Только формы (border/radial-gradient/box-shadow),
-    линии, кружки, emoji, геометрические иконки.
-  - НЕ вставляй сам текст песни в виджет (он выводится отдельно над карточкой).
-    В виджете допустимы короткие подписи, цифры, названия кнопок.
-  - Виджет должен УЗНАВАЕМО выглядеть как кусок интерфейса iPhone и быть
-    СМЫСЛОВО СВЯЗАН со строкой (например, для строки про расставание — экран
-    звонка или удаления контакта; про деньги — Apple Pay/кошелёк; про время —
-    будильник/таймер; про погоду — погода; про дорогу — карты/компас;
-    про встречу — уведомление/iMessage; про любовь — экран пароля/фейс-айди/
-    харт-реакция; и т.п.). Не повторяй один и тот же виджет в соседних строках.
-* theme       — "dark" | "light".
-* accent      — hex-цвета акцента (например #0a84ff, #ff375f, #30d158, #bf5af2).
-* background  — {"type": "gradient"|"rain"|"sunset"|"light"|"solid", "colors": [hex, hex]}.
-* entrance    — "rise" | "slide" | "fade" | "pop" — как карточка появляется.
+Возвращай ТОЛЬКО JSON-МАССИВ. Никакого markdown, никаких ```json, никакого поясняющего текста до/после.
+"""
 
-Возвращай ТОЛЬКО валидный JSON-МАССИВ без markdown, без пояснений.
-НЕ оборачивай ответ в ```json. Каждый объект ОБЯЗАТЕЛЬНО содержит widget_html.
+# Shorter follow-up prompt for subsequent batches (saves tokens).
+_DIRECTOR_FOLLOWUP_HINT = """\
+Продолжаем песню. Тебе приходит следующая порция строк (продолжение).
+Оформи каждую сцену ТЕМ ЖЕ форматом, что и раньше: массив объектов с
+scene_id + widget_html/theme/accent/background/entrance. Не повторяй виджеты
+из предыдущих строк.
 """
 
 
@@ -259,22 +258,25 @@ _QUEUE_TIMEOUT = 600.0
 _BATCH_PAUSE = 1.0
 
 
-def _call_batch(client, batch: list[dict], model: str | None) -> list[dict]:
-    """Send one batch of scenes and return the parsed scene list."""
-    user_prompt = (
-        "Обработай эти сцены (добавь widget_html/theme/accent/background/entrance "
-        "к КАЖДОЙ, сохранив порядок и words):\n"
-        + json.dumps(batch, ensure_ascii=False, indent=2)
-    )
-    prompt = f"{DIRECTOR_PROMPT}\n\n{user_prompt}"
+def _call_batch(session, batch_llm: list[dict], is_first: bool, model: str | None) -> list[dict]:
+    """Send one batch of scenes (MINIMAL shape) over the provided chat session."""
+    if is_first:
+        user_prompt = (
+            DIRECTOR_SYSTEM_PROMPT
+            + "\n\n---\n\nПервая порция сцен — оформи каждую как описано выше:\n"
+            + json.dumps(batch_llm, ensure_ascii=False, indent=2)
+        )
+    else:
+        user_prompt = (
+            _DIRECTOR_FOLLOWUP_HINT
+            + "\n" + json.dumps(batch_llm, ensure_ascii=False, indent=2)
+        )
     cfg = GenerationConfig(queue_timeout=_QUEUE_TIMEOUT)
     last_err: Exception | None = None
     for attempt in range(_BATCH_RETRIES + 1):
         try:
-            if model:
-                text = client.complete(prompt, model=model, config=cfg)
-            else:
-                text = client.complete(prompt, config=cfg)
+            # session.send_message is multi-turn; it keeps the same conversation_id
+            text = session.send_message(user_prompt)
             break
         except QueueTimeoutError as e:
             last_err = e
@@ -286,7 +288,6 @@ def _call_batch(client, batch: list[dict], model: str | None) -> list[dict]:
             last_err = e
             raise
     else:
-        # Shouldn't be reached but satisfy type checker
         raise last_err if last_err else RuntimeError("Arena call failed")
 
     cleaned = _strip_json(text)
@@ -294,9 +295,10 @@ def _call_batch(client, batch: list[dict], model: str | None) -> list[dict]:
         out = json.loads(cleaned)
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON: {e}; preview: {text[:600]!r}")
-    if not isinstance(out, list) or len(out) != len(batch):
+    if not isinstance(out, list) or len(out) != len(batch_llm):
         raise ValueError(
-            f"Batch size mismatch: sent {len(batch)}, got {len(out) if isinstance(out,list) else type(out).__name__}"
+            f"Batch size mismatch: sent {len(batch_llm)}, got "
+            f"{len(out) if isinstance(out,list) else type(out).__name__}"
         )
     return out
 
@@ -305,23 +307,35 @@ def ask_arena(all_scenes: list[dict], model: str | None) -> list[dict]:
     if not _ARENA_OK:
         return _stub_scenes(all_scenes)
 
+    # Build the LLM-facing payload WITHOUT the per-word array — it only
+    # bloats the prompt and is not needed for widget generation.
+    llm_scenes = [
+        {"scene_id": s["scene_id"], "start": s["start"], "end": s["end"], "line": s["line"]}
+        for s in all_scenes
+    ]
+
     options = AutoOptions(fast_model=model is None)
     out_scenes: list[dict] = []
     with auto_direct_client(options, verification_token="auto") as client:
+        # ONE multi-turn chat for all batches so Arena keeps context about
+        # widget variety/style and does not start a fresh conversation
+        # each time (which is what caused the infinite new-chat loop).
+        session = client.chat(model=model, config=GenerationConfig(queue_timeout=_QUEUE_TIMEOUT))
+        is_first = True
         for i in range(0, len(all_scenes), _BATCH_SIZE):
-            batch = all_scenes[i : i + _BATCH_SIZE]
-            batch_out = _call_batch(client, batch, model)
-            # Sanity-check every scene in the batch contains widget_html.
-            for s_in, s_out in zip(batch, batch_out):
+            batch_full = all_scenes[i : i + _BATCH_SIZE]
+            batch_llm  = llm_scenes[i : i + _BATCH_SIZE]
+            batch_out  = _call_batch(session, batch_llm, is_first, model)
+            is_first = False
+            for s_in, s_out in zip(batch_full, batch_out):
                 if not isinstance(s_out, dict) or not s_out.get("widget_html"):
-                    # Fall back to a minimal placeholder so the UI still renders
                     s_out = _ensure_widget(s_in, s_out if isinstance(s_out, dict) else {})
-                # Make sure words/line/timing from the input survive the LLM
+                # Force-internal fields (LLM may omit/alter them)
                 s_out["scene_id"] = s_in["scene_id"]
-                s_out["start"] = s_in["start"]
-                s_out["end"] = s_in["end"]
-                s_out["line"] = s_in["line"]
-                s_out["words"] = s_in["words"]
+                s_out["start"]    = s_in["start"]
+                s_out["end"]      = s_in["end"]
+                s_out["line"]     = s_in["line"]
+                s_out["words"]    = s_in["words"]
                 s_out.setdefault("theme", "dark")
                 s_out.setdefault("accent", "#0a84ff")
                 s_out.setdefault("background", {"type": "gradient", "colors": ["#0b0c10", "#1c1c2b"]})
@@ -429,31 +443,34 @@ async def generate_lyrics(
     if not scenes:
         raise HTTPException(status_code=422, detail="Не удалось разбить текст на строки.")
 
-    payload = [
+    # Build numbered scenes (with words) to pass to ask_arena.
+    # ask_arena itself strips `words` before sending to the LLM to save
+    # tokens and avoid hitting input/context limits.
+    numbered_scenes = [
         {
             "scene_id": i + 1,
-            "start": s["start"],
-            "end": s["end"],
-            "line": s["line"],
-            "words": s["words"],
+            "start":    s["start"],
+            "end":      s["end"],
+            "line":     s["line"],
+            "words":    s["words"],
         }
         for i, s in enumerate(scenes)
     ]
 
-    # 4. Ask Arena for widget_html (batched)
+    # 4. Ask Arena for widget_html (batched, single chat session)
     t1 = time.monotonic()
     arena_err: str | None = None
     try:
-        scenes_out = ask_arena(payload, model_name or None)
+        scenes_out = ask_arena(numbered_scenes, model_name or None)
     except QueueTimeoutError as e:
         arena_err = (
             f"Превышен таймаут Arena ({_QUEUE_TIMEOUT:.0f}s). Попробуй быструю модель "
             f"или разбей трек на части. ({e})"
         )
-        scenes_out = _stub_scenes(payload)
+        scenes_out = _stub_scenes(numbered_scenes)
     except Exception as exc:  # noqa: BLE001
         arena_err = f"Ошибка Arena: {exc}"
-        scenes_out = _stub_scenes(payload)
+        scenes_out = _stub_scenes(numbered_scenes)
     arena_ms = int((time.monotonic() - t1) * 1000)
 
     state_path = STATE_DIR / f"{track_id}.json"
