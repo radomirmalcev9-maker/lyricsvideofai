@@ -429,10 +429,26 @@ function applyScene(idx){
   lyricsEl.classList.remove('enter'); void lyricsEl.offsetWidth; lyricsEl.classList.add('enter');
 }
 
+/* Robust "which scene is at time t?" lookup.
+ * Returns the index of the scene whose start is the LATEST one still <= t,
+ * clamped to the last scene for overshoots. This never returns -1 once
+ * there are scenes — so the user cannot see a skipped/frozen scene even
+ * if a scene's [start,end) interval has a rounding gap on the server side.
+ */
+function findSceneAt(t){
+  if (!currentScenes.length) return -1;
+  let best = 0;
+  for (let i=0;i<currentScenes.length;i++){
+    if (currentScenes[i].start <= t + 0.001) best = i;
+    else break; // scenes are sorted by start
+  }
+  return best;
+}
+
 /* Playback sync */
 audio.addEventListener('timeupdate', () => {
   const t = audio.currentTime;
-  const idx = currentScenes.findIndex(s => t >= s.start && t < s.end);
+  const idx = findSceneAt(t);
   if (idx !== -1) applyScene(idx);
   // Per-word karaoke
   const s = currentScenes[idx];
@@ -584,7 +600,7 @@ async function startExport(){
   function paint(now){
     const t = (now-t0)/1000;
     if (t >= dur){ if(!stopped){stopped=true;rec.stop(); if(mediaSrc)try{mediaSrc.src.stop();}catch(e){}} return; }
-    const idx = currentScenes.findIndex(s=>t>=s.start&&t<s.end);
+    const idx = findSceneAt(t);
     if (idx!==-1 && idx!==activeIdx) applyScene(idx);
     drawSceneToCanvas(ctx, currentScenes[idx], t, dur, accentFor(currentScenes[idx]),
                       _WIDGET_IMG_CACHE.get(currentScenes[idx]?.scene_id) || null);
