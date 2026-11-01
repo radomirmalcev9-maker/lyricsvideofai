@@ -1,44 +1,88 @@
 # Apple Motion Lyrics Generator
 
-Вертикальные 9:16 lyric-видео в стиле Apple/iOS Motion — из MP3 за один клик.
+Вертикальные 9:16 lyric-видео в стиле Apple/iOS Motion.
 
-## Стек
-- **FastAPI + Uvicorn** — бэкенд.
-- **faster-whisper** — транскрибация и тайминги строк.
-- **arena_api** (из `arenaaispofandpars/`) — LLM через Arena Direct Chat, которая подбирает iOS-виджет под каждую строку.
-- **Чистый HTML/CSS/JS** — фронтенд: статус-бар iOS, glassmorphism-виджеты, 3D-наклон, кинетическая типографика, плеер с обложкой.
-- **MP4 1080×1920** — экспорт через `canvas.captureStream()` + `MediaRecorder`.
+## Как работает
 
-## Запуск
+1. Загружаешь **MP3 + готовый текст песни** (одна строка = одна сцена).
+2. `faster-whisper` распознаёт аудио с **поточечными таймингами СЛОВ**.
+3. Лёгкий aligner сопоставляет слова из твоего текста со словами Whisper
+   (нормализация + fuzzy-сопоставление), так что тайминги получаются точными
+   даже с авторскими опечатками и пунктуацией.
+4. Пакет сцен (с `start/end` каждой строки и `start/end` каждого слова)
+   отправляется в LLM через Arena Direct Chat.
+5. **Нет встроенных шаблонов виджетов.** Нейросеть сама придумывает и
+   верстает виджет **с нуля** на каждую строку как встроенный HTML+CSS-фрагмент
+   (в рамках стилистики iOS: баннеры, диалоги, экраны настроек, карточки
+   контактов, анимации и т. п. — что подходит по смыслу строки).
+6. Фронт показывает предпросмотр 9:16 с **караоке-подсветкой слов**: текущее
+   слово подсвечивается акцентным цветом и подпрыгивает, сказанные затухают
+   в белый, будущие полупрозрачные.
+7. Кнопка **Экспорт MP4** рендерит 1080×1920@60fps через
+   `canvas.captureStream + MediaRecorder`, смешивая с аудиодорожкой.
 
+## Быстрый старт
+
+**Windows** — дважды кликни `start.bat` (сам ставит Python-зависимости и
+Playwright Chromium, открывает браузер).
+
+**Linux/macOS:**
 ```bash
 cd my-lyrics-app
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-# Для работы Arena-вызова — нужна активная сессия в arena.ai в локальном браузере
-# и установленный arena-api с extras:
-pip install -e ../arenaaispofandpars/[auto]
-
-python server.py
-# Открой http://127.0.0.1:4770/static/index.html
+chmod +x start.sh && ./start.sh
 ```
 
-Если сессии Arena нет, сервер работает в **stub-режиме** и отдаёт демонстрационные
-сцены, чтобы можно было отрабатывать UI и экспорт без входа в Arena.
+Открой <http://127.0.0.1:4770/static/index.html>.
+
+В интерфейсе:
+1. Загрузи MP3 в верхнюю дроп-зону.
+2. Вставь полный текст песни в текстовое поле — одна сцена = одна строка,
+   между сценами делай перенос строки.
+3. Выбери модель (быстрая по умолчанию) и нажми «Сгенерировать».
+4. Нажатие на карточку сцены в левой панели перематывает трек на начало
+   этой строки.
 
 ## Структура проекта
 ```
 my-lyrics-app/
-├── server.py                 # FastAPI: /api/generate, /api/health
+├── server.py        # FastAPI: Whisper word-level align + Arena LLM
 ├── requirements.txt
+├── start.bat / start.sh
 └── static/
-    ├── index.html            # UI, рендер виджетов, экспорт MP4
-    ├── uploads/              # загруженные MP3
-    └── state/                # кэш сцен по track_id
+    └── index.html   # UI с караоке-типографикой и внедрением AI-виджетов
 ```
 
-## Поддерживаемые виджеты
-`face_id`, `voice` (Siri), `heart_like`, `battery`, `share_location`, `maps`,
-`notes`, `photo_note`, `palette` (с кошельком), `stopwatch`, `contacts`,
-`reaction` (смайлы), `imessage`, `weather`, `player`, `toggle`, `timer`,
-`heart_rate`, плюс фоны `gradient`/`rain`/`light`/`noise` и акцентные цвета.
+## API
+
+- `POST /api/generate` — multipart/form-data:
+    - `file` — MP3
+    - `lyrics` — текст песни (UTF-8), одна строка = одна сцена
+    - `model_name` (опционально) — `fast`, `max`, `claude-opus-4-6`, …
+    - `language` (опционально) — ISO-код языка для Whisper, по умолчанию `ru`
+  - возвращает `{track_id, audio_url, scenes[], timings_ms}`.
+- `GET /api/health` — статус.
+
+## Формат сцены
+
+Каждая сцена в ответе сервера:
+```json
+{
+  "scene_id": 1,
+  "start": 0.0, "end": 2.4,
+  "line": "И всё, что ты во мне видишь,",
+  "words": [
+    {"word": "И",     "start": 0.0, "end": 0.4, "aligned": true},
+    {"word": "всё,",  "start": 0.4, "end": 0.8, "aligned": true},
+    ...
+  ],
+  "widget_html": "<div class=\"w\" style=\"...\"> ... </div>",
+  "theme": "dark",
+  "accent": "#0a84ff",
+  "background": {"type": "gradient|rain|sunset|light|solid", "colors": ["#...", "#..."]},
+  "entrance": "rise|slide|fade|pop"
+}
+```
+
+`widget_html` — это полностью self-contained HTML/CSS, который вставляется в
+контейнер `.widget-slot` на сцене. LLM может использовать любые inline-стили,
+но без `<img>`, внешних шрифтов и тяжёлой графики.
