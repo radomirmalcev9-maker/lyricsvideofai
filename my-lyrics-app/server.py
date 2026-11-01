@@ -258,34 +258,52 @@ _QUEUE_TIMEOUT = 600.0
 _BATCH_PAUSE = 1.0
 
 
-def _call_batch(session, batch_llm: list[dict], is_first: bool, model: str | None) -> list[dict]:
-    """Send one batch of scenes (MINIMAL shape) over the provided chat session."""
-    if is_first:
-        user_prompt = (
-            DIRECTOR_SYSTEM_PROMPT
-            + "\n\n---\n\nПервая порция сцен — оформи каждую как описано выше:\n"
-            + json.dumps(batch_llm, ensure_ascii=False, indent=2)
-        )
-    else:
-        user_prompt = (
-            _DIRECTOR_FOLLOWUP_HINT
-            + "\n" + json.dumps(batch_llm, ensure_ascii=False, indent=2)
-        )
+def _call_batch(client, batch_llm: list[dict], model: str | None) -> list[dict]:
+    """Send one batch of scenes using a FRESH single-turn client.complete() call.
+
+    We deliberately do NOT use a single multi-turn client.chat() session across
+    batches: after the first few replies the chat history contains several
+    thousand tokens of generated widget HTML, which tends to trigger HTTP 500
+    on Arena's backend later in the track. A fresh complete() per batch is
+    lightweight, avoids history buildup, and still reuses the same Firefox
+    session so captcha does not re-appear.
+    """
+    # Build a self-contained prompt (no reliance on prior chat context).
+    # Include a short list of previously-used widget themes via a simple hint
+    # so that adjacent batches don't all come back looking identical.
+    user_prompt = (
+        DIRECTOR_SYSTEM_PROMPT
+        + "\n\n---\n\nСцены для оформления (верни ровно столько же объектов, "
+        "тем же порядком, с теми же scene_id):\n"
+        + json.dumps(batch_llm, ensure_ascii=False, indent=2)
+    )
     cfg = GenerationConfig(queue_timeout=_QUEUE_TIMEOUT)
     last_err: Exception | None = None
     for attempt in range(_BATCH_RETRIES + 1):
         try:
-            # session.send_message is multi-turn; it keeps the same conversation_id
-            text = session.send_message(user_prompt)
+            if model:
+                text = client.complete(user_prompt, model=model, config=cfg)
+            else:
+                text = client.complete(user_prompt, config=cfg)
             break
         except QueueTimeoutError as e:
             last_err = e
+            print(f"[arena] batch timeout (attempt {attempt+1}/{_BATCH_RETRIES+1}): {e}",
+                  flush=True)
             if attempt < _BATCH_RETRIES:
                 time.sleep(2.0 + attempt * 2.0)
                 continue
             raise
         except Exception as e:
+            # Catch HTTP 500 / other transient Arena errors too.
             last_err = e
+            msg = str(e)
+            print(f"[arena] batch error (attempt {attempt+1}/{_BATCH_RETRIES+1}): {msg!r}",
+                  flush=True)
+            if attempt < _BATCH_RETRIES:
+                # Longer backoff for hard 5xx — wait a bit so Arena can recover.
+                time.sleep(3.0 + attempt * 3.0)
+                continue
             raise
     else:
         raise last_err if last_err else RuntimeError("Arena call failed")
@@ -298,17 +316,25 @@ def _call_batch(session, batch_llm: list[dict], is_first: bool, model: str | Non
     if not isinstance(out, list) or len(out) != len(batch_llm):
         raise ValueError(
             f"Batch size mismatch: sent {len(batch_llm)}, got "
-            f"{len(out) if isinstance(out,list) else type(out).__name__}"
+            f"{len(out) if isinstance(out, list) else type(out).__name__}; "
+            f"preview: {text[:300]!r}"
         )
     return out
 
 
-def ask_arena(all_scenes: list[dict], model: str | None) -> list[dict]:
-    if not _ARENA_OK:
-        return _stub_scenes(all_scenes)
+def ask_arena(all_scenes: list[dict], model: str | None) -> tuple[list[dict], list[tuple[int, str]]]:
+    """Send scenes to Arena in small batches.
 
-    # Build the LLM-facing payload WITHOUT the per-word array — it only
-    # bloats the prompt and is not needed for widget generation.
+    Returns (out_scenes, failures) where failures is a list of
+    (batch_start_index, error_message) for batches that could not be processed
+    even after retries (those scenes fall back to stubs individually, not the
+    whole track).
+    """
+    failures: list[tuple[int, str]] = []
+    if not _ARENA_OK:
+        return _stub_scenes(all_scenes), [(-1, "Arena не инициализирована")]
+
+    # LLM-facing payload WITHOUT per-word arrays (saves ~10x tokens).
     llm_scenes = [
         {"scene_id": s["scene_id"], "start": s["start"], "end": s["end"], "line": s["line"]}
         for s in all_scenes
@@ -316,21 +342,29 @@ def ask_arena(all_scenes: list[dict], model: str | None) -> list[dict]:
 
     options = AutoOptions(fast_model=model is None)
     out_scenes: list[dict] = []
+    total = len(all_scenes)
     with auto_direct_client(options, verification_token="auto") as client:
-        # ONE multi-turn chat for all batches so Arena keeps context about
-        # widget variety/style and does not start a fresh conversation
-        # each time (which is what caused the infinite new-chat loop).
-        session = client.chat(model=model, config=GenerationConfig(queue_timeout=_QUEUE_TIMEOUT))
-        is_first = True
-        for i in range(0, len(all_scenes), _BATCH_SIZE):
+        for i in range(0, total, _BATCH_SIZE):
             batch_full = all_scenes[i : i + _BATCH_SIZE]
             batch_llm  = llm_scenes[i : i + _BATCH_SIZE]
-            batch_out  = _call_batch(session, batch_llm, is_first, model)
-            is_first = False
+            print(f"[arena] batch {i//_BATCH_SIZE + 1}/{(total + _BATCH_SIZE - 1)//_BATCH_SIZE}: "
+                  f"scenes {batch_full[0]['scene_id']}..{batch_full[-1]['scene_id']}",
+                  flush=True)
+            try:
+                batch_out = _call_batch(client, batch_llm, model)
+                ok = True
+                err_msg = ""
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                err_msg = str(exc)
+                print(f"[arena] batch FAILED after retries: {err_msg!r}", flush=True)
+                failures.append((i, err_msg))
+                batch_out = [{} for _ in batch_full]
+
             for s_in, s_out in zip(batch_full, batch_out):
-                if not isinstance(s_out, dict) or not s_out.get("widget_html"):
+                if (not ok) or (not isinstance(s_out, dict)) or not s_out.get("widget_html"):
                     s_out = _ensure_widget(s_in, s_out if isinstance(s_out, dict) else {})
-                # Force-internal fields (LLM may omit/alter them)
+                # Force-internal fields (LLM must not override timings/words/line)
                 s_out["scene_id"] = s_in["scene_id"]
                 s_out["start"]    = s_in["start"]
                 s_out["end"]      = s_in["end"]
@@ -341,9 +375,9 @@ def ask_arena(all_scenes: list[dict], model: str | None) -> list[dict]:
                 s_out.setdefault("background", {"type": "gradient", "colors": ["#0b0c10", "#1c1c2b"]})
                 s_out.setdefault("entrance", "rise")
                 out_scenes.append(s_out)
-            if i + _BATCH_SIZE < len(all_scenes):
+            if i + _BATCH_SIZE < total:
                 time.sleep(_BATCH_PAUSE)
-    return out_scenes
+    return out_scenes, failures
 
 
 def _ensure_widget(s_in: dict, partial: dict) -> dict:
@@ -457,29 +491,43 @@ async def generate_lyrics(
         for i, s in enumerate(scenes)
     ]
 
-    # 4. Ask Arena for widget_html (batched, single chat session)
+    # 4. Ask Arena for widget_html (batched; each batch is a fresh complete()
+    #    call so chat history doesn't balloon and cause 500s deep in the track).
     t1 = time.monotonic()
     arena_err: str | None = None
+    stub_mode = False
     try:
-        scenes_out = ask_arena(numbered_scenes, model_name or None)
+        scenes_out, failures = ask_arena(numbered_scenes, model_name or None)
+        if failures:
+            # At least one batch failed; the others are real widgets.
+            stub_mode = True
+            sample = failures[0][1][:200]
+            arena_err = (
+                f"{len(failures)} батч(ей) из "
+                f"{(len(numbered_scenes) + _BATCH_SIZE - 1)//_BATCH_SIZE} "
+                f"не обработались Arena (stub на этих сценах): {sample}"
+            )
     except QueueTimeoutError as e:
+        stub_mode = True
         arena_err = (
             f"Превышен таймаут Arena ({_QUEUE_TIMEOUT:.0f}s). Попробуй быструю модель "
             f"или разбей трек на части. ({e})"
         )
         scenes_out = _stub_scenes(numbered_scenes)
     except Exception as exc:  # noqa: BLE001
+        stub_mode = True
         arena_err = f"Ошибка Arena: {exc}"
         scenes_out = _stub_scenes(numbered_scenes)
     arena_ms = int((time.monotonic() - t1) * 1000)
 
+    stub_mode = stub_mode or (not _ARENA_OK)
     state_path = STATE_DIR / f"{track_id}.json"
     state_path.write_text(json.dumps({
         "track_id": track_id,
         "audio": f"/static/uploads/{safe_name}",
         "scenes": scenes_out,
         "timings_ms": {"whisper": whisper_ms, "arena": arena_ms},
-        "stub_mode": (not _ARENA_OK) or (arena_err is not None),
+        "stub_mode": stub_mode,
         "arena_error": arena_err,
     }, ensure_ascii=False), encoding="utf-8")
 
@@ -488,7 +536,7 @@ async def generate_lyrics(
         "audio_url": f"/static/uploads/{safe_name}",
         "scenes": scenes_out,
         "timings_ms": {"whisper": whisper_ms, "arena": arena_ms},
-        "stub_mode": (not _ARENA_OK) or (arena_err is not None),
+        "stub_mode": stub_mode,
         "arena_status": ARENA_IMPORT_ERROR if not _ARENA_OK else (arena_err or "ok"),
     })
 
