@@ -3,14 +3,12 @@
 Flow:
   1. User uploads MP3 + lyrics text (one visual line per linebreak).
   2. faster-whisper transcribes with word_timestamps=True.
-  3. A lightweight aligner maps every word of the user-supplied lyrics
-     to the nearest Whisper word by normalized-text substring/fuzzy match,
+  3. Aligner maps every user-supplied word to the nearest Whisper word,
      giving per-word start/end times per scene-line.
-  4. Each line (with per-word timings) goes to the LLM as a JSON scene.
-  5. The LLM invents an iOS-style widget from scratch as a self-contained
-     HTML+CSS snippet (no pre-defined templates).
-  6. Frontend plays audio, highlights words in karaoke fashion and injects
-     each scene's widget HTML into the glass card at the right time.
+  4. Scenes are sent to the LLM in SMALL BATCHES (a handful of lines at a
+     time so each response fits well under the queue timeout). The LLM
+     invents an iOS-style widget per scene as self-contained HTML+CSS.
+  5. Batches are stitched back together by scene_id and returned to the UI.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 # --------------------------------------------------------------------------- #
-# Paths & app bootstrap
+# Paths & bootstrap
 # --------------------------------------------------------------------------- #
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,12 +39,11 @@ STATE_DIR = STATIC_DIR / "state"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Make the sibling arenaaispofandpars/ importable.
 _REPO_ROOT = BASE_DIR.parent
 if str(_REPO_ROOT / "arenaaispofandpars") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "arenaaispofandpars"))
 
-app = FastAPI(title="Apple Motion Lyrics", version="0.2.0")
+app = FastAPI(title="Apple Motion Lyrics", version="0.3.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -69,32 +66,39 @@ def get_whisper():
 
 
 # --------------------------------------------------------------------------- #
-# Arena client
+# Arena client (lazy)
 # --------------------------------------------------------------------------- #
 
 ARENA_IMPORT_ERROR: str | None = None
 try:
     from arena_api import AutoOptions, auto_direct_client  # type: ignore
+    from arena_api.models import GenerationConfig  # type: ignore
+    from arena_api.exceptions import QueueTimeoutError  # type: ignore
     _ARENA_OK = True
 except Exception as exc:  # noqa: BLE001
     _ARENA_OK = False
     ARENA_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+    # define fallbacks so the rest of server.py can import without arena installed
+    class GenerationConfig:  # type: ignore
+        def __init__(self, queue_timeout=180.0, extra=None):
+            self.queue_timeout = queue_timeout
+            self.extra = extra or {}
+    class QueueTimeoutError(Exception):  # type: ignore
+        pass
 
 
 # --------------------------------------------------------------------------- #
-# Text normalization + aligner
+# Normalization and aligner
 # --------------------------------------------------------------------------- #
 
 _PUNCT_RE = re.compile(r"[^\w0-9а-яА-ЯёЁa-zA-Z]+", flags=re.UNICODE)
 
 
 def _norm(s: str) -> str:
-    """Normalize a word for loose matching: lowercase, strip punctuation."""
     return _PUNCT_RE.sub("", (s or "").lower()).strip()
 
 
 def transcribe_words(audio_path: Path, language: str | None = None) -> list[dict]:
-    """Return a list of Whisper word dicts: {start, end, word, norm}."""
     model = get_whisper()
     segments, _info = model.transcribe(
         str(audio_path),
@@ -118,38 +122,24 @@ def transcribe_words(audio_path: Path, language: str | None = None) -> list[dict
 
 
 def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
-    """Split lyrics into visual lines and assign timings to every word.
-
-    Strategy: walk the user lyrics word-by-word. For each word look through
-    Whisper words that haven't been consumed yet and pick the best match
-    (first by exact normalized equality, falling back to difflib ratio
-    >0.72; punctuation-only "words" inherit the timing of the previous
-    real word). Lines split on '\\n' become scenes.
-    """
     lines_raw = [ln.strip() for ln in lyrics_text.splitlines()]
     lines_raw = [ln for ln in lines_raw if ln]
 
-    # Tokenize lyrics into (line_index, original_token)
     tokens: list[tuple[int, str]] = []
     for li, line in enumerate(lines_raw):
-        # Split into whitespace-separated tokens but keep punctuation attached.
         for tok in re.split(r"(\s+)", line):
             if not tok or tok.isspace():
                 continue
             tokens.append((li, tok))
 
     scenes: list[dict] = [{"line": ln, "words": []} for ln in lines_raw]
-
-    # Punctuation-only tokens (commas, dashes, ellipsis) get their timing
-    # from the previous real word.
     last_real_t = {"start": 0.0, "end": 0.0}
-    w_idx = 0  # cursor in whisper_words
+    w_idx = 0
     n_w = len(whisper_words)
 
     for li, tok in tokens:
         n = _norm(tok)
         if not n:
-            # punctuation-only token: attach to previous timing, duration ~0
             s = last_real_t["end"]
             scenes[li]["words"].append({
                 "word": tok, "start": round(s, 3),
@@ -159,8 +149,7 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
 
         best_j = -1
         best_score = 0.0
-        # Search in a rolling window of upcoming Whisper words
-        for j in range(w_idx, min(w_idx + 60, n_w)):
+        for j in range(w_idx, min(w_idx + 80, n_w)):
             ww = whisper_words[j]
             wn = ww["norm"]
             if not wn:
@@ -169,7 +158,6 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
                 best_j = j
                 best_score = 1.0
                 break
-            # prefix/substring
             if n.startswith(wn) or wn.startswith(n):
                 score = min(len(n), len(wn)) / max(len(n), len(wn))
                 if score > best_score:
@@ -182,7 +170,6 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
                 best_j = j
 
         if best_j == -1:
-            # Fall back to projecting linearly from the last known timing.
             s = last_real_t["end"]
             scenes[li]["words"].append({
                 "word": tok, "start": round(s, 3), "end": round(s + 0.3, 3),
@@ -200,137 +187,188 @@ def align_lyrics(lyrics_text: str, whisper_words: list[dict]) -> list[dict]:
         last_real_t = {"start": s, "end": e}
         w_idx = best_j + 1
 
-    # Scene-level start/end = first/last word times
     for sc in scenes:
         if not sc["words"]:
             sc["start"] = 0.0
             sc["end"] = 0.0
             continue
         sc["start"] = sc["words"][0]["start"]
-        sc["end"] = sc["words"][-1]["end"]
-        # Small tail so the line doesn't cut off too abruptly.
-        sc["end"] = round(sc["end"] + 0.15, 3)
+        sc["end"] = round(sc["words"][-1]["end"] + 0.15, 3)
     return scenes
 
 
 # --------------------------------------------------------------------------- #
-# Director prompt — NO widget templates. LLM invents HTML/CSS from scratch.
+# Director prompt (NO templates; AI invents widget HTML from scratch per scene)
 # --------------------------------------------------------------------------- #
 
-SYSTEM_DIRECTOR_PROMPT = """\
-Ты — ведущий моушн-дизайнер, арт-директор вертикальных lyric-видео в стиле iOS / Apple Motion (9:16).
+DIRECTOR_PROMPT = """\
+Ты — ведущий моушн-дизайнер и арт-директор вертикальных lyric-видео в стиле iOS / Apple Motion (9:16).
 
-Тебе дан JSON-массив сцен песни. Каждая сцена = одна строка трека, которая показывается на экране
-от start до end секунд. У сцены есть words[] с точными таймингами каждого СЛОВА (start/end в секундах).
+Тебе дан JSON-МАССИВ СЦЕН. Каждая сцена = одна строка трека с таймингами start/end (секунды),
+и словами words[] (каждое со своим start/end).
 
-Твоя задача — для КАЖДОЙ сцены:
-1. Выбрать атмосферу (тёмная / светлая), акцентный hex-цвет и абстрактное описание фона
-   (ночной дождь, закат, неон-город, студия, туманное небо, белый лист и т.д.).
-2. Придумать и СВЕРСТАТЬ виджет с НУЛЯ как self-contained HTML+CSS-врезку — это должен быть
-   узнаваемый фрагмент интерфейса iPhone (но не обязательно существующий экран!), максимально
-   подходящий по смыслу строки. Можно использовать ЛЮБЫЕ идеи: анимированная иконка, диалог iMessage,
-   экран будильника, карточка контакта, фейковый баннер уведомления, платёж, камера, галерея фото,
-   фитнес-кольца, экран звонка, погода, таймер, пароль, Face ID, локатор, заметка, голосовой мемо,
-   кошелёк, карта, музыкальный плеер, скриншот чата, шкала громкости, авиарежим, компас, календарь,
-   напоминание, покупка в App Store — что угодно, ГЛАВНОЕ: виджет должен быть СВЯЗАН СО СМЫСЛОМ СТРОКИ,
-   а не случайным шаблоном.
-3. Вернуть СТРОГО JSON-массив без markdown и без комментариев, одной JSON-структурой.
+Для КАЖДОЙ сцены в этом массиве верни ОБЪЕКТ с теми же scene_id, start, end, line, words
+и ДОПОЛНИТЕЛЬНО с полями widget_html, theme, accent, background, entrance.
+ВАЖНО: на выходе должен быть РОВНО ТОТ ЖЕ МАССИВ той же длины, в том же порядке,
+scene_id и words не изменяй.
 
-Технические требования к HTML виджета (widget_html):
-- Обёртка виджета — <div class="w" style="...">. Карточка сама отвечает за свою внутреннюю вёрстку.
-- Пространство карточки: ~820×520 px с внутренним padding 40-60 px, скругление углов ~56px,
-  backdrop-filter blur, полупрозрачный тёмный или светлый фон под стать theme.
-- Шрифты системные: -apple-system, SF Pro Display. Размеры шрифтов в px (под 1080×1920).
-- Можно использовать inline <style> только внутри виджета, ограничивая правила .w .что-то.
-- В анимациях используй только CSS @keyframes (transform / opacity).
-- НЕ ИСПОЛЬЗУЙ картинок, <img>, <svg> со сложной графикой, шрифтов из интернета — только формы,
-  линии, градиенты, кружки, emoji, простые геометрические иконки через border/radial-gradient/box-shadow.
-- НЕ вставляй сам текст песни в виджет — текст песни рендерится отдельно под/над виджетом.
-  Виджет может содержать короткие свои подписи (название экрана, цифры, имена кнопок).
+Поля, которые ты ДОБАВЛЯЕШЬ к каждой сцене:
 
-Поля каждой сцены (копируй start/end/words из входа как есть):
-- scene_id (int, начиная с 1)
-- start, end           — копируй из входа
-- line                — копируй текст строки
-- words               — массив словоформ как во входе, не изменяй тайминги
-- widget_html         — string, один self-contained HTML-фрагмент карточки с inline-стилями
-- theme               — "dark" | "light"
-- accent              — hex-цвет, используется для подсветки текста и акцентов интерфейса
-- background          — {type: "gradient"|"rain"|"solid"|"sunset", colors: [hex, hex]}
-- entrance            — "rise" | "slide" | "fade" | "pop" — как карточка появляется на строке
+* widget_html — self-contained HTML+CSS фрагмент ОДНОЙ карточки виджета.
+  - Обёртка: <div class="w" style="...">...</div>
+  - Карточка занимает прямоугольник ~820x520px с padding 40-60px,
+    border-radius ~56px, полупрозрачный фон, backdrop-filter blur
+    (стеклянная карточка iOS).
+  - Шрифт: -apple-system, "SF Pro Display", системный.
+  - Можно использовать <style>.w ...</style> внутри карточки для анимаций.
+  - Анимации только CSS @keyframes (transform/opacity).
+  - НЕ используй <img>, <svg> со сложной графикой, внешние шрифты,
+    сторонние библиотеки. Только формы (border/radial-gradient/box-shadow),
+    линии, кружки, emoji, геометрические иконки.
+  - НЕ вставляй сам текст песни в виджет (он выводится отдельно над карточкой).
+    В виджете допустимы короткие подписи, цифры, названия кнопок.
+  - Виджет должен УЗНАВАЕМО выглядеть как кусок интерфейса iPhone и быть
+    СМЫСЛОВО СВЯЗАН со строкой (например, для строки про расставание — экран
+    звонка или удаления контакта; про деньги — Apple Pay/кошелёк; про время —
+    будильник/таймер; про погоду — погода; про дорогу — карты/компас;
+    про встречу — уведомление/iMessage; про любовь — экран пароля/фейс-айди/
+    харт-реакция; и т.п.). Не повторяй один и тот же виджет в соседних строках.
+* theme       — "dark" | "light".
+* accent      — hex-цвета акцента (например #0a84ff, #ff375f, #30d158, #bf5af2).
+* background  — {"type": "gradient"|"rain"|"sunset"|"light"|"solid", "colors": [hex, hex]}.
+* entrance    — "rise" | "slide" | "fade" | "pop" — как карточка появляется.
 
-Возвращай ВАЛИДНЫЙ JSON. Без текста до и после. Без ```json-обёртки.
+Возвращай ТОЛЬКО валидный JSON-МАССИВ без markdown, без пояснений.
+НЕ оборачивай ответ в ```json. Каждый объект ОБЯЗАТЕЛЬНО содержит widget_html.
 """
 
 
 # --------------------------------------------------------------------------- #
-# Arena call
+# Arena call with batching + retries + generous timeout
 # --------------------------------------------------------------------------- #
 
-def ask_arena(system_prompt: str, user_payload: list[dict], model: str | None) -> str:
-    if not _ARENA_OK:
-        return _stub_scenes(user_payload)
-    options = AutoOptions(fast_model=model is None)
+# Send this many scenes per LLM request. Smaller batches = faster, more reliable,
+# less chance of hitting the queue timeout.
+_BATCH_SIZE = 6
+# How many times to retry a batch that times out before giving up.
+_BATCH_RETRIES = 2
+# Per-request streaming timeout. Widgets are short HTML snippets but the model
+# may take a while to produce several of them; 10 minutes covers long tracks.
+_QUEUE_TIMEOUT = 600.0
+# Between-batch pause (seconds) to give the browser a chance to cool down.
+_BATCH_PAUSE = 1.0
+
+
+def _call_batch(client, batch: list[dict], model: str | None) -> list[dict]:
+    """Send one batch of scenes and return the parsed scene list."""
     user_prompt = (
-        "Вот сцены с таймингами слов:\n"
-        + json.dumps(user_payload, ensure_ascii=False, indent=2)
-        + "\n\nСгенерируй widget_html для КАЖДОЙ сцены как описано в инструкции."
+        "Обработай эти сцены (добавь widget_html/theme/accent/background/entrance "
+        "к КАЖДОЙ, сохранив порядок и words):\n"
+        + json.dumps(batch, ensure_ascii=False, indent=2)
     )
-    prompt = f"{system_prompt}\n\n{user_prompt}"
+    prompt = f"{DIRECTOR_PROMPT}\n\n{user_prompt}"
+    cfg = GenerationConfig(queue_timeout=_QUEUE_TIMEOUT)
+    last_err: Exception | None = None
+    for attempt in range(_BATCH_RETRIES + 1):
+        try:
+            if model:
+                text = client.complete(prompt, model=model, config=cfg)
+            else:
+                text = client.complete(prompt, config=cfg)
+            break
+        except QueueTimeoutError as e:
+            last_err = e
+            if attempt < _BATCH_RETRIES:
+                time.sleep(2.0 + attempt * 2.0)
+                continue
+            raise
+        except Exception as e:
+            last_err = e
+            raise
+    else:
+        # Shouldn't be reached but satisfy type checker
+        raise last_err if last_err else RuntimeError("Arena call failed")
+
+    cleaned = _strip_json(text)
+    try:
+        out = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}; preview: {text[:600]!r}")
+    if not isinstance(out, list) or len(out) != len(batch):
+        raise ValueError(
+            f"Batch size mismatch: sent {len(batch)}, got {len(out) if isinstance(out,list) else type(out).__name__}"
+        )
+    return out
+
+
+def ask_arena(all_scenes: list[dict], model: str | None) -> list[dict]:
+    if not _ARENA_OK:
+        return _stub_scenes(all_scenes)
+
+    options = AutoOptions(fast_model=model is None)
+    out_scenes: list[dict] = []
     with auto_direct_client(options, verification_token="auto") as client:
-        if model:
-            text = client.complete(prompt, model=model)
-        else:
-            text = client.complete(prompt)
-    return text
+        for i in range(0, len(all_scenes), _BATCH_SIZE):
+            batch = all_scenes[i : i + _BATCH_SIZE]
+            batch_out = _call_batch(client, batch, model)
+            # Sanity-check every scene in the batch contains widget_html.
+            for s_in, s_out in zip(batch, batch_out):
+                if not isinstance(s_out, dict) or not s_out.get("widget_html"):
+                    # Fall back to a minimal placeholder so the UI still renders
+                    s_out = _ensure_widget(s_in, s_out if isinstance(s_out, dict) else {})
+                # Make sure words/line/timing from the input survive the LLM
+                s_out["scene_id"] = s_in["scene_id"]
+                s_out["start"] = s_in["start"]
+                s_out["end"] = s_in["end"]
+                s_out["line"] = s_in["line"]
+                s_out["words"] = s_in["words"]
+                s_out.setdefault("theme", "dark")
+                s_out.setdefault("accent", "#0a84ff")
+                s_out.setdefault("background", {"type": "gradient", "colors": ["#0b0c10", "#1c1c2b"]})
+                s_out.setdefault("entrance", "rise")
+                out_scenes.append(s_out)
+            if i + _BATCH_SIZE < len(all_scenes):
+                time.sleep(_BATCH_PAUSE)
+    return out_scenes
 
 
-# --------------------------------------------------------------------------- #
-# Stub (for development without Arena) — minimal placeholder widgets,
-# still real HTML so the frontend can render scenes even offline.
-# --------------------------------------------------------------------------- #
+def _ensure_widget(s_in: dict, partial: dict) -> dict:
+    accent = partial.get("accent", "#0a84ff")
+    theme = partial.get("theme", "dark")
+    return {
+        **partial,
+        "theme": theme,
+        "accent": accent,
+        "background": partial.get("background", {"type": "gradient", "colors": ["#0b0c10", "#1c1c2b"]}),
+        "entrance": partial.get("entrance", "rise"),
+        "widget_html": (
+            f'<div class="w" style="background:rgba(28,28,30,.72);border:1.5px solid rgba(255,255,255,.12);'
+            f'border-radius:56px;padding:48px;color:#fff;-webkit-backdrop-filter:blur(50px) saturate(140%);'
+            f'backdrop-filter:blur(50px) saturate(140%);box-shadow:0 40px 100px rgba(0,0,0,.55);">'
+            f'<div style="font-size:28px;color:rgba(255,255,255,.6);font-weight:700;">SCENE {s_in["scene_id"]}</div>'
+            f'<div style="margin-top:40px;font-size:64px;font-weight:800;color:{accent};">AI</div>'
+            f'<div style="margin-top:16px;font-size:26px;color:rgba(255,255,255,.55);">placeholder widget</div>'
+            f'</div>'
+        ),
+    }
 
-def _stub_scenes(scenes: list[dict]) -> str:
+
+def _stub_scenes(scenes: list[dict]) -> list[dict]:
+    """Offline stub: deterministic placeholder widgets so the UI works without Arena."""
     import random
     random.seed(7)
     accents = ["#0a84ff", "#ff375f", "#30d158", "#bf5af2", "#ff9f0a", "#64d2ff", "#ffd60a"]
     out = []
     for i, sc in enumerate(scenes):
         accent = accents[i % len(accents)]
-        theme = "dark"
-        bg_colors = ["#0b0c10", "#1c1c2b"]
-        html = (
-            f'<div class="w" style="background:rgba(28,28,30,.72);border:1.5px solid rgba(255,255,255,.12);'
-            f'border-radius:56px;padding:48px;color:#fff;-webkit-backdrop-filter:blur(50px) saturate(140%);'
-            f'backdrop-filter:blur(50px) saturate(140%);box-shadow:0 40px 100px rgba(0,0,0,.55);">'
-            f'<div style="display:flex;justify-content:space-between;align-items:center;">'
-            f'<div style="font-size:28px;color:rgba(255,255,255,.6);font-weight:700;letter-spacing:.04em;">SCENE {i+1}</div>'
-            f'<div style="font-size:22px;color:{accent};font-weight:700;">LIVE</div>'
-            f'</div>'
-            f'<div style="margin-top:40px;font-size:76px;font-weight:800;letter-spacing:-.03em;">{accent}</div>'
-            f'<div style="margin-top:20px;height:18px;background:rgba(255,255,255,.12);border-radius:12px;overflow:hidden;">'
-            f'<div style="width:{int((i+1)/max(1,len(scenes))*100)}%;height:100%;background:{accent};"></div></div>'
-            f'<div style="margin-top:30px;font-size:26px;color:rgba(255,255,255,.55);">Stub-виджет — подключи Arena для настоящих.</div>'
-            f'</div>'
-        )
-        out.append({
-            "scene_id": i + 1,
-            "start": sc["start"],
-            "end": sc["end"],
-            "line": sc["line"],
-            "words": sc["words"],
-            "widget_html": html,
-            "theme": theme,
+        out.append(_ensure_widget(sc, {
+            "theme": "dark",
             "accent": accent,
-            "background": {"type": "gradient", "colors": bg_colors},
+            "background": {"type": "gradient", "colors": ["#0b0c10", "#1c1c2b"]},
             "entrance": "rise",
-        })
-    return json.dumps(out, ensure_ascii=False)
+        }))
+    return out
 
-
-# --------------------------------------------------------------------------- #
-# JSON cleanup
-# --------------------------------------------------------------------------- #
 
 def _strip_json(text: str) -> str:
     text = (text or "").strip()
@@ -363,7 +401,8 @@ async def generate_lyrics(
     model_name: str = Form("fast"),
     language: str = Form("ru"),
 ):
-    if not lyrics or not lyrics.strip():
+    lyrics = (lyrics or "").strip()
+    if not lyrics:
         raise HTTPException(status_code=422, detail="Нужен текст песни (поле lyrics).")
 
     # 1. Save audio
@@ -377,20 +416,19 @@ async def generate_lyrics(
     finally:
         await file.close()
 
-    # 2. Whisper word timestamps
+    # 2. Whisper word timings
     t0 = time.monotonic()
     try:
         whisper_words = transcribe_words(file_path, language or None)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Whisper failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"Whisper error: {exc}")
     whisper_ms = int((time.monotonic() - t0) * 1000)
 
-    # 3. Align user lyrics to Whisper words (per-word timings per line)
+    # 3. Align user lyrics → scenes with per-word timings
     scenes = align_lyrics(lyrics, whisper_words)
     if not scenes:
         raise HTTPException(status_code=422, detail="Не удалось разбить текст на строки.")
 
-    # Build the payload we send to the LLM (only structural fields, no html yet).
     payload = [
         {
             "scene_id": i + 1,
@@ -402,32 +440,30 @@ async def generate_lyrics(
         for i, s in enumerate(scenes)
     ]
 
-    # 4. Ask Arena to invent widget_html for each scene
+    # 4. Ask Arena for widget_html (batched)
     t1 = time.monotonic()
-    raw_text = ask_arena(SYSTEM_DIRECTOR_PROMPT, payload, model_name or None)
+    arena_err: str | None = None
+    try:
+        scenes_out = ask_arena(payload, model_name or None)
+    except QueueTimeoutError as e:
+        arena_err = (
+            f"Превышен таймаут Arena ({_QUEUE_TIMEOUT:.0f}s). Попробуй быструю модель "
+            f"или разбей трек на части. ({e})"
+        )
+        scenes_out = _stub_scenes(payload)
+    except Exception as exc:  # noqa: BLE001
+        arena_err = f"Ошибка Arena: {exc}"
+        scenes_out = _stub_scenes(payload)
     arena_ms = int((time.monotonic() - t1) * 1000)
 
-    cleaned = _strip_json(raw_text)
-    try:
-        scenes_out = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        return JSONResponse(status_code=502, content={
-            "error": "Модель вернула невалидный JSON.",
-            "raw_preview": raw_text[:1500],
-            "json_error": str(e),
-        })
-
-    if not isinstance(scenes_out, list):
-        raise HTTPException(status_code=502, detail="Ожидался массив сцен.")
-
-    # 5. Persist state
     state_path = STATE_DIR / f"{track_id}.json"
     state_path.write_text(json.dumps({
         "track_id": track_id,
         "audio": f"/static/uploads/{safe_name}",
         "scenes": scenes_out,
         "timings_ms": {"whisper": whisper_ms, "arena": arena_ms},
-        "stub_mode": not _ARENA_OK,
+        "stub_mode": (not _ARENA_OK) or (arena_err is not None),
+        "arena_error": arena_err,
     }, ensure_ascii=False), encoding="utf-8")
 
     return JSONResponse({
@@ -435,8 +471,8 @@ async def generate_lyrics(
         "audio_url": f"/static/uploads/{safe_name}",
         "scenes": scenes_out,
         "timings_ms": {"whisper": whisper_ms, "arena": arena_ms},
-        "stub_mode": not _ARENA_OK,
-        "arena_status": ARENA_IMPORT_ERROR if not _ARENA_OK else "ok",
+        "stub_mode": (not _ARENA_OK) or (arena_err is not None),
+        "arena_status": ARENA_IMPORT_ERROR if not _ARENA_OK else (arena_err or "ok"),
     })
 
 
@@ -447,6 +483,8 @@ def health():
         "arena": "ok" if _ARENA_OK else "unavailable",
         "arena_error": ARENA_IMPORT_ERROR,
         "whisper_model": _WHISPER_MODEL_SIZE,
+        "queue_timeout_s": _QUEUE_TIMEOUT,
+        "batch_size": _BATCH_SIZE,
     }
 
 

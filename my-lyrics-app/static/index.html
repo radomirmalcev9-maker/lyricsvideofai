@@ -340,7 +340,14 @@ async function generate(){
     $('#mpArtist').textContent = (data.stub_mode ? '⚠ STUB · ' : '') + (modelSel.options[modelSel.selectedIndex]?.text || '');
     renderScenesGrid();
     applyScene(0);
-    status('Готово: '+currentScenes.length+' сцен · Whisper '+data.timings_ms.whisper+'ms · Arena '+data.timings_ms.arena+'ms'+(data.stub_mode?' · STUB':''), 'ok');
+    const okMsg = 'Готово: '+currentScenes.length+' сцен · Whisper '+data.timings_ms.whisper+'ms · Arena '+data.timings_ms.arena+'ms';
+    if (data.stub_mode && data.arena_status && data.arena_status !== 'ok') {
+      status(okMsg+' · STUB: '+data.arena_status, 'err');
+    } else if (data.stub_mode) {
+      status(okMsg+' · STUB (Arena недоступна, виджеты-заглушки)', 'err');
+    } else {
+      status(okMsg, 'ok');
+    }
     exportBtn.disabled = currentScenes.length === 0;
   }catch(e){
     status('Ошибка: '+e.message, 'err');
