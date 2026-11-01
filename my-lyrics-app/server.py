@@ -350,7 +350,10 @@ if __name__ == "__main__":
 
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "4770"))
-    print(f"\n🎵  Apple Motion Lyrics running at http://{host}:{port}/static/index.html\n")
+    print()
+    print("  [Apple Motion Lyrics]")
+    print(f"  Open: http://{host}:{port}/static/index.html")
+    print()
     uvicorn.run(
         "server:app",
         host=host,
